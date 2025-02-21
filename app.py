@@ -6,6 +6,7 @@ import numpy as np
 import colorsys
 import pandas as pd
 import tkinter as tk
+import xml.etree.ElementTree as ET
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 import tempfile
@@ -17,30 +18,96 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 #########################
 
 
-def load_annotations(annotation_dir):
+def load_annotations(annotation_dir, annotation_type="COCO", image_dir="", yolo_labels_file=""):
     annotations_by_filename = {}
     categories = {}
-    for json_file in glob.glob(os.path.join(annotation_dir, '*.json')):
-        with open(json_file, 'r') as f:
-            data = json.load(f)
-        image_id_to_filename = {}
-        if 'images' in data:
-            for image in data['images']:
-                image_id_to_filename[image['id']] = image['file_name']
-        if 'annotations' in data:
-            for ann in data['annotations']:
-                img_id = ann.get('image_id')
-                filename = image_id_to_filename.get(img_id)
-                if filename is None:
-                    continue
-                annotations_by_filename.setdefault(filename, []).append(ann)
-        if 'categories' in data:
-            for cat in data['categories']:
-                cat_id = cat.get('id')
-                cat_name = cat.get('name', str(cat_id))
-                if cat_id not in categories:
+    image_id_to_filename = {}
+    agcontexts = {}
+    info = {}
+
+    def yolo_to_coco(yolo_bbox, img_width, img_height):
+        class_id, center_x, center_y, width, height = map(float, yolo_bbox)
+        x = (center_x - width / 2) * img_width
+        y = (center_y - height / 2) * img_height
+        w = width * img_width
+        h = height * img_height
+        return [int(x), int(y), int(w), int(h)]
+
+    yolo_categories = {}
+    if yolo_labels_file and os.path.exists(yolo_labels_file):
+        with open(yolo_labels_file, 'r') as f:
+            for i, line in enumerate(f):
+                yolo_categories[i] = line.strip()
+
+    if annotation_type == "COCO":
+        for json_file in glob.glob(os.path.join(annotation_dir, '*.json')):
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+            if 'images' in data:
+                for image in data['images']:
+                    # Store full info for potential agcontext mapping
+                    image_id_to_filename[image['id']] = {'file_name': os.path.basename(image['file_name']),
+                                                        'agcontext_id': image.get('agcontext_id', 0)}
+            if 'annotations' in data:
+                for ann in data['annotations']:
+                    img_id = ann.get('image_id')
+                    img_info = image_id_to_filename.get(img_id)
+                    if img_info:
+                        filename = img_info['file_name']  # Use basename only
+                        annotations_by_filename.setdefault(filename, []).append(ann)
+            if 'categories' in data:
+                for cat in data['categories']:
+                    cat_id = cat.get('id')
+                    cat_name = cat.get('name', str(cat_id))
                     categories[cat_id] = cat_name
-    return annotations_by_filename, categories
+            if 'agcontexts' in data:
+                for agc in data['agcontexts']:
+                    agcontexts[agc['id']] = agc
+            if 'info' in data:
+                info = data['info']
+
+    elif annotation_type == "VOC":
+        for xml_file in glob.glob(os.path.join(annotation_dir, '*.xml')):
+            tree = ET.parse(xml_file)
+            root = tree.getroot()
+            filename = root.find('filename').text
+            size = root.find('size')
+            img_width = int(size.find('width').text)
+            img_height = int(size.find('height').text)
+            for obj in root.findall('object'):
+                name = obj.find('name').text
+                cat_id = hash(name) % 10000
+                categories[cat_id] = name
+                bndbox = obj.find('bndbox')
+                xmin = int(bndbox.find('xmin').text)
+                ymin = int(bndbox.find('ymin').text)
+                xmax = int(bndbox.find('xmax').text)
+                ymax = int(bndbox.find('ymax').text)
+                bbox = [xmin, ymin, xmax - xmin, ymax - ymin]
+                ann = {'category_id': cat_id, 'bbox': bbox}
+                annotations_by_filename.setdefault(filename, []).append(ann)
+
+    elif annotation_type == "YOLO":
+        for txt_file in glob.glob(os.path.join(annotation_dir, '*.txt')):
+            filename = os.path.splitext(os.path.basename(txt_file))[0] + '.jpg'  # Adjust extension if needed
+            image_path = os.path.join(image_dir, filename)
+            if os.path.exists(image_path):
+                img = cv2.imread(image_path)
+                if img is not None:
+                    img_height, img_width = img.shape[:2]
+                    with open(txt_file, 'r') as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if len(parts) == 5:
+                                class_id = int(parts[0])
+                                bbox = yolo_to_coco(parts[1:], img_width, img_height)
+                                ann = {'category_id': class_id, 'bbox': bbox}
+                                annotations_by_filename.setdefault(filename, []).append(ann)
+                    if yolo_categories:
+                        for cid in range(len(yolo_categories)):
+                            categories[cid] = yolo_categories.get(cid, f"class_{cid}")
+
+    return annotations_by_filename, categories, agcontexts, info
 
 
 def generate_category_colors(categories):
@@ -440,6 +507,7 @@ class SidePanel:
 
         # Create all tabs
         self.create_load_data_tab()
+        self.create_metadata_tab()
         self.filtered_tab = FilteredViewTab(self.notebook, self.app)
         self.create_comments_tab()
         self.create_stats_tab()
@@ -452,12 +520,10 @@ class SidePanel:
         self.load_data_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.load_data_frame, text="Load Data")
 
-        # Create a container frame with padding
         container = ttk.Frame(self.load_data_frame, padding="10")
         container.pack(fill=tk.BOTH, expand=True)
 
-        # Grid configuration for better spacing
-        for i in range(4):
+        for i in range(5):  # Increased to accommodate new row
             container.grid_columnconfigure(i, weight=1)
 
         # Annotations directory row
@@ -484,80 +550,130 @@ class SidePanel:
         browse_btn3 = ttk.Button(container, text="Browse", command=self.app.browse_output_file)
         browse_btn3.grid(row=2, column=3, padx=5, pady=8)
 
+        # Annotation type selection
+        ttk.Label(container, text="Annotation Type:", font=("Helvetica", 11)).grid(
+            row=3, column=0, sticky=tk.W, padx=5, pady=8)
+        self.annotation_type = tk.StringVar(value="COCO")
+        ttk.Radiobutton(container, text="COCO", variable=self.annotation_type, value="COCO",
+                        command=self.toggle_yolo_labels).grid(row=3, column=1, sticky=tk.W, padx=5)
+        ttk.Radiobutton(container, text="VOC", variable=self.annotation_type, value="VOC",
+                        command=self.toggle_yolo_labels).grid(row=3, column=2, sticky=tk.W, padx=5)
+        ttk.Radiobutton(container, text="YOLO", variable=self.annotation_type, value="YOLO",
+                        command=self.toggle_yolo_labels).grid(row=3, column=3, sticky=tk.W, padx=5)
+
+        # YOLO labels file row (hidden by default)
+        self.yolo_labels_label = ttk.Label(container, text="YOLO Labels File:", font=("Helvetica", 11))
+        self.yolo_labels_entry = ttk.Entry(container, width=35, font=("Helvetica", 11))
+        self.yolo_labels_button = ttk.Button(container, text="Browse", command=self.app.browse_yolo_labels)
+        self.toggle_yolo_labels()  # Initial state
+
         # Buttons row
         btn_frame = ttk.Frame(container)
-        btn_frame.grid(row=3, column=0, columnspan=4, pady=15)
-
+        btn_frame.grid(row=5, column=0, columnspan=4, pady=15)
         btn_load = ttk.Button(btn_frame, text="Load Data", command=self.app.load_data, width=15)
         btn_load.pack(side=tk.LEFT, padx=5)
-
         btn_save = ttk.Button(btn_frame, text="Save Settings", command=self.app.save_settings, width=15)
         btn_save.pack(side=tk.LEFT, padx=5)
+
+    def toggle_yolo_labels(self):
+        if self.annotation_type.get() == "YOLO":
+            self.yolo_labels_label.grid(row=4, column=0, sticky=tk.W, padx=5, pady=8)
+            self.yolo_labels_entry.grid(row=4, column=1, columnspan=2, sticky=tk.EW, padx=5, pady=8)
+            self.yolo_labels_button.grid(row=4, column=3, padx=5, pady=8)
+        else:
+            self.yolo_labels_label.grid_remove()
+            self.yolo_labels_entry.grid_remove()
+            self.yolo_labels_button.grid_remove()
+
+    def create_metadata_tab(self):
+        self.metadata_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.metadata_frame, text="Metadata")
+
+        # Scrollable frame for metadata
+        canvas = tk.Canvas(self.metadata_frame)
+        scrollbar = ttk.Scrollbar(self.metadata_frame, orient=tk.VERTICAL, command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.metadata_text = tk.Text(scrollable_frame, height=20, width=40, font=("Helvetica", 10), wrap=tk.WORD)
+        self.metadata_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.metadata_text.config(state=tk.DISABLED)
+
+    def update_metadata(self):
+        if self.annotation_type.get() != "COCO" or not hasattr(self.app, 'agcontexts') or not hasattr(self.app, 'info'):
+            self.metadata_text.config(state=tk.NORMAL)
+            self.metadata_text.delete("1.0", tk.END)
+            self.metadata_text.insert(tk.END, "Metadata only available for COCO/WeedCOCO format.")
+            self.metadata_text.config(state=tk.DISABLED)
+            return
+
+        self.metadata_text.config(state=tk.NORMAL)
+        self.metadata_text.delete("1.0", tk.END)
+        metadata_str = "WeedCOCO Metadata\n\n"
+        metadata_str += "Info:\n" + json.dumps(self.app.info, indent=2) + "\n\n"
+        if self.app.agcontexts:
+            # Simplified: assumes one agcontext (ID 0); adjust if image-specific mapping is needed
+            agc = self.app.agcontexts.get(0, {})
+            metadata_str += "Agricultural Context:\n" + json.dumps(agc, indent=2)
+        self.metadata_text.insert(tk.END, metadata_str)
+        self.metadata_text.config(state=tk.DISABLED)
 
     def create_comments_tab(self):
         self.comments_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.comments_frame, text="Comments")
 
-        # Create a vertical paned window for resizable comments area
         comments_paned = tk.PanedWindow(self.comments_frame, orient=tk.VERTICAL, sashrelief=tk.RAISED, sashwidth=4)
         comments_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Upper section: Comments viewing area (READ-ONLY)
         comments_upper = ttk.Frame(comments_paned)
         comments_paned.add(comments_upper, height=200, stretch="first")
 
-        # Header for comments section
         header_frame = ttk.Frame(comments_upper)
         header_frame.pack(fill=tk.X, anchor=tk.W, padx=5, pady=5)
 
         ttk.Label(header_frame, text="Comments for current image (read-only):",
                   font=("Helvetica", 11, "bold")).pack(side=tk.LEFT)
 
-        # Frame for text area with border
         text_frame = ttk.Frame(comments_upper, borderwidth=1, relief="solid")
         text_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Make this text widget read-only
         self.comment_text = tk.Text(text_frame, height=10, font=("Helvetica", 11), state=tk.DISABLED)
         self.comment_text.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
-        # Add a scrollbar
         scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.comment_text.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.comment_text.config(yscrollcommand=scrollbar.set)
 
-        # Lower section: Comments list/history or additional controls
         comments_lower = ttk.Frame(comments_paned)
         comments_paned.add(comments_lower, height=100)
 
-        # Add a title for the lower section
         ttk.Label(comments_lower, text="Recent Comments:",
                   font=("Helvetica", 11, "bold")).pack(anchor=tk.W, padx=5, pady=5)
 
-        # Add a listbox to show recently commented images
         recent_frame = ttk.Frame(comments_lower, borderwidth=1, relief="solid")
         recent_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         self.recent_comments = tk.Listbox(recent_frame, font=("Helvetica", 10))
         self.recent_comments.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Add a scrollbar
         recent_scroll = ttk.Scrollbar(recent_frame, orient=tk.VERTICAL, command=self.recent_comments.yview)
         recent_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.recent_comments.config(yscrollcommand=recent_scroll.set)
 
-        # Bind double-click to navigate to the selected image
         self.recent_comments.bind("<Double-1>", self.on_recent_comment_select)
 
-        # Export button with padding at the bottom
         btn_frame = ttk.Frame(self.comments_frame)
         btn_frame.pack(fill=tk.X, padx=5, pady=10)
 
-        # Use self.app.export_reviews instead of self.export_reviews
         btn_export = ttk.Button(btn_frame, text="Export Reviews", command=self.app.export_reviews, width=15)
         btn_export.pack(side=tk.RIGHT, padx=5)
 
-        # Store references in the app
         self.app.side_panel_comment_text = self.comment_text
         self.app.recent_comments = self.recent_comments
 
@@ -572,7 +688,6 @@ class SidePanel:
 
         filename = selected_item.split(":", 1)[0].strip()
 
-        # Navigate directly to the selected image; load_new_image() will save the current comment.
         if filename in self.app.image_files:
             self.app.current_index = self.app.image_files.index(filename)
             self.app.load_new_image(save_current=False)
@@ -581,11 +696,9 @@ class SidePanel:
         self.stats_frame = ttk.Frame(self.notebook, padding="10")
         self.notebook.add(self.stats_frame, text="Stats")
 
-        # Add a button to generate statistics
         btn_stats = ttk.Button(self.stats_frame, text="Generate Statistics", command=self.app.generate_stats, width=20)
         btn_stats.pack(pady=10)
 
-        # Frame for summary information
         summary_frame = ttk.LabelFrame(self.stats_frame, text="Summary", padding="5")
         summary_frame.pack(fill=tk.X, padx=5, pady=5)
 
@@ -593,11 +706,9 @@ class SidePanel:
                                              font=("Helvetica", 11), justify=tk.LEFT)
         self.stats_summary_label.pack(anchor=tk.W, padx=5, pady=5)
 
-        # Frame for the chart
         self.chart_frame = ttk.Frame(self.stats_frame, borderwidth=1, relief="solid")
         self.chart_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Make these accessible to the main app
         self.app.stats_summary_label = self.stats_summary_label
         self.app.chart_frame = self.chart_frame
 
@@ -605,7 +716,6 @@ class SidePanel:
         self.heatmap_frame = ttk.Frame(self.notebook, padding="10")
         self.notebook.add(self.heatmap_frame, text="Heat Map")
 
-        # Controls for generating the heatmap
         controls_frame = ttk.Frame(self.heatmap_frame)
         controls_frame.pack(fill=tk.X, padx=5, pady=5)
 
@@ -616,16 +726,13 @@ class SidePanel:
         btn = ttk.Button(controls_frame, text="Generate Heat Map", command=self.app.generate_heatmap, width=15)
         btn.pack(side=tk.LEFT, padx=15)
 
-        # Frame for the heatmap chart
         self.heatmap_chart_frame = ttk.Frame(self.heatmap_frame, borderwidth=1, relief="solid")
         self.heatmap_chart_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=10)
 
-        # Add initial guidance text
         guidance = ttk.Label(self.heatmap_chart_frame, text="Select a class and click 'Generate Heat Map'",
                              font=("Helvetica", 11), foreground="#555555")
         guidance.pack(expand=True, pady=20)
 
-        # Make these accessible to the main app
         self.app.heatmap_class_combobox = self.heatmap_class_combobox
         self.app.heatmap_chart_frame = self.heatmap_chart_frame
 
@@ -679,6 +786,9 @@ class ImageReviewApp:
         self.orig_pan_y = 0  # For dragging
         self.current_image_var = tk.StringVar(value="No image loaded")  # Current image indicator
         self.char_count_var = tk.StringVar(value="0 characters")  # Comment character counter
+        self.yolo_labels_file = ""
+        self.agcontexts = {}  # Store WeedCOCO agricultural contexts
+        self.info = {}  # Store WeedCOCO info
 
         # Initialize UI component references that will be set by SidePanel
         self.stats_summary_label = None
@@ -763,7 +873,6 @@ class ImageReviewApp:
 
         # Load settings on startup
         self.load_settings()
-        self.load_comments_from_temp()
 
         # Set up the close handler
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -1395,6 +1504,8 @@ class ImageReviewApp:
             if self.recent_comments:
                 self.update_recent_comments_list()
 
+            self.side_panel.update_metadata()
+
         except Exception as e:
             messagebox.showerror("Error", f"Error loading image {current_file}: {str(e)}")
             print(f"Error loading image: {str(e)}")
@@ -1803,6 +1914,8 @@ class ImageReviewApp:
         self.annotation_dir = self.side_panel.ann_dir_entry.get().strip()
         self.image_dir = self.side_panel.img_dir_entry.get().strip()
         self.output_excel = self.side_panel.output_entry.get().strip()
+        annotation_type = self.side_panel.annotation_type.get()
+        self.yolo_labels_file = self.side_panel.yolo_labels_entry.get().strip() if annotation_type == "YOLO" else ""
         if not os.path.isdir(self.annotation_dir):
             messagebox.showerror("Error", "Invalid annotations directory.")
             return
@@ -1812,7 +1925,8 @@ class ImageReviewApp:
         if not self.output_excel.endswith(".xlsx"):
             messagebox.showerror("Error", "Output file must have a .xlsx extension.")
             return
-        self.annotations_by_filename, self.categories = load_annotations(self.annotation_dir)
+        self.annotations_by_filename, self.categories, self.agcontexts, self.info = load_annotations(
+            self.annotation_dir, annotation_type, self.image_dir, self.yolo_labels_file)
         self.category_colors = generate_category_colors(self.categories)
         self.side_panel.filtered_tab.populate_class_list(self.categories)
         self.class_name_to_id = {cat_name: cat_id for cat_id, cat_name in self.categories.items()}
@@ -1821,25 +1935,39 @@ class ImageReviewApp:
             if self.categories:
                 self.heatmap_class_combobox.current(0)
         valid_exts = ('.png', '.jpg', '.jpeg', '.bmp')
-        self.image_files = sorted([f for f in os.listdir(self.image_dir)
-                                   if f.lower().endswith(valid_exts)])
+        self.image_files = sorted([f for f in os.listdir(self.image_dir) if f.lower().endswith(valid_exts)])
         if not self.image_files:
             messagebox.showerror("Error", "No images found in the image directory.")
             return
         self.current_index = 0
-
-        # Check if temp comments match the new dataset
-        current_hash = self._get_image_files_hash()
-        if (self.image_dir == self.last_image_dir and
-                current_hash == self.last_image_files_hash):
-            # Keep existing comments loaded from temp file
-            print(f"Retained {len(self.comments)} comments for matching dataset")
+        if os.path.exists(self.temp_comments_file):
+            try:
+                with open(self.temp_comments_file, 'r') as f:
+                    data = json.load(f)
+                    saved_image_dir = data.get("image_dir", "")
+                    saved_hash = data.get("image_files_hash", "")
+                    saved_comments = data.get("comments", {})
+                    current_hash = self._get_image_files_hash()
+                    if self.image_dir == saved_image_dir and current_hash == saved_hash:
+                        self.comments = saved_comments
+                        print(f"Loaded {len(self.comments)} comments from temp file")
+                    else:
+                        self.comments = {}
+                        print("Dataset mismatch; comments not loaded")
+            except Exception as e:
+                print(f"Failed to load comments from temp file: {e}")
+                self.comments = {}
         else:
             self.comments = {}
-            print("New dataset detected; comments reset")
-
         self.update_counter()
         self.load_new_image()
+
+    def browse_yolo_labels(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Text Files", "*.txt")])
+        if file_path:
+            self.side_panel.yolo_labels_entry.delete(0, tk.END)
+            self.side_panel.yolo_labels_entry.insert(0, file_path)
+            self.yolo_labels_file = file_path
 
     def _get_image_files_hash(self):
         """Generate a hash of the current image files list to detect changes"""
