@@ -494,8 +494,6 @@ class SidePanel:
         btn_save = ttk.Button(btn_frame, text="Save Settings", command=self.app.save_settings, width=15)
         btn_save.pack(side=tk.LEFT, padx=5)
 
-    # Replace the create_comments_tab method in your SidePanel class
-
     def create_comments_tab(self):
         self.comments_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.comments_frame, text="Comments")
@@ -504,7 +502,7 @@ class SidePanel:
         comments_paned = tk.PanedWindow(self.comments_frame, orient=tk.VERTICAL, sashrelief=tk.RAISED, sashwidth=4)
         comments_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Upper section: Comments editing area
+        # Upper section: Comments viewing area (READ-ONLY)
         comments_upper = ttk.Frame(comments_paned)
         comments_paned.add(comments_upper, height=200, stretch="first")
 
@@ -512,31 +510,21 @@ class SidePanel:
         header_frame = ttk.Frame(comments_upper)
         header_frame.pack(fill=tk.X, anchor=tk.W, padx=5, pady=5)
 
-        ttk.Label(header_frame, text="Comments for current image:",
+        ttk.Label(header_frame, text="Comments for current image (read-only):",
                   font=("Helvetica", 11, "bold")).pack(side=tk.LEFT)
-
-        # Add a save button
-        save_btn = ttk.Button(header_frame, text="Save",
-                              command=self.app.save_comment, width=8)
-        save_btn.pack(side=tk.RIGHT, padx=5)
 
         # Frame for text area with border
         text_frame = ttk.Frame(comments_upper, borderwidth=1, relief="solid")
         text_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        self.comment_text = tk.Text(text_frame, height=10, font=("Helvetica", 11))
+        # Make this text widget read-only
+        self.comment_text = tk.Text(text_frame, height=10, font=("Helvetica", 11), state=tk.DISABLED)
         self.comment_text.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
         # Add a scrollbar
         scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.comment_text.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.comment_text.config(yscrollcommand=scrollbar.set)
-
-        # Bind focus out to save comment
-        self.comment_text.bind("<FocusOut>", lambda e: self.app.save_comment())
-
-        # Handle Tab key properly
-        self.comment_text.bind("<Tab>", self.app.handle_tab_key)
 
         # Lower section: Comments list/history or additional controls
         comments_lower = ttk.Frame(comments_paned)
@@ -565,6 +553,7 @@ class SidePanel:
         btn_frame = ttk.Frame(self.comments_frame)
         btn_frame.pack(fill=tk.X, padx=5, pady=10)
 
+        # Use self.app.export_reviews instead of self.export_reviews
         btn_export = ttk.Button(btn_frame, text="Export Reviews", command=self.app.export_reviews, width=15)
         btn_export.pack(side=tk.RIGHT, padx=5)
 
@@ -573,25 +562,20 @@ class SidePanel:
         self.app.recent_comments = self.recent_comments
 
     def on_recent_comment_select(self, event):
-        """Navigate to an image from the recent comments list"""
         selection = self.recent_comments.curselection()
         if not selection:
             return
 
-        # Get the selected filename
         selected_item = self.recent_comments.get(selection[0])
         if ":" not in selected_item:
             return
 
         filename = selected_item.split(":", 1)[0].strip()
 
-        # Save current comment
-        self.app.save_comment()
-
-        # Navigate to the selected image
+        # Navigate directly to the selected image; load_new_image() will save the current comment.
         if filename in self.app.image_files:
             self.app.current_index = self.app.image_files.index(filename)
-            self.app.load_new_image()
+            self.app.load_new_image(save_current=False)
 
     def create_stats_tab(self):
         self.stats_frame = ttk.Frame(self.notebook, padding="10")
@@ -653,6 +637,8 @@ class ImageReviewApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Image Review Tool")
+        icon = tk.PhotoImage(file="icon.png")
+        root.iconphoto(True, icon)
 
         # Configure ttk style for a more modern look
         style = ttk.Style()
@@ -679,7 +665,7 @@ class ImageReviewApp:
         self.base_cv_image = None
         self.highlighted_annotation_index = None
         self.class_name_to_id = {}
-
+        self._is_navigating = False
         self.canvas_width = 800
         self.canvas_height = 600
         self.side_panel_visible = True
@@ -703,6 +689,11 @@ class ImageReviewApp:
         self.persistent_comment_text = None  # For the persistent comments pane
         self.side_panel_comment_text = None  # For the side panel comments
         self.recent_comments = None  # For the list of recent comments
+
+        # create a temp file for comments to be saved across sessions
+        self.temp_comments_file = os.path.join(tempfile.gettempdir(), "image_review_comments.json")
+        self.last_image_dir = None  # Track the last loaded image directory
+        self.last_image_files_hash = None
 
         # Create a vertical PanedWindow for the main content + persistent comments
         self.main_vertical_paned = tk.PanedWindow(
@@ -772,6 +763,7 @@ class ImageReviewApp:
 
         # Load settings on startup
         self.load_settings()
+        self.load_comments_from_temp()
 
         # Set up the close handler
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -1247,7 +1239,7 @@ class ImageReviewApp:
         # Text widget for comments with scrollbar - CRITICAL: Name it correctly
         self.persistent_comment_text = tk.Text(text_frame, height=5, font=("Helvetica", 11))
         self.persistent_comment_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2, pady=2)
-
+        self.persistent_comment_text.bind("<FocusOut>", lambda e: self.save_comment(force_save=True))
         # For backward compatibility - this ensures both references point to the same widget
         self.comment_text = self.persistent_comment_text
 
@@ -1280,24 +1272,21 @@ class ImageReviewApp:
         self.persistent_comment_text.bind("<Tab>", self.handle_tab_key)
 
     def clear_comment(self):
-        """Clear the comment in both text areas"""
-        if hasattr(self, 'persistent_comment_text') and self.persistent_comment_text:
+        """Clear the comment in the editable area and remove it from storage"""
+        if self.persistent_comment_text:
             self.persistent_comment_text.delete("1.0", tk.END)
 
-        if hasattr(self.side_panel, 'comment_text') and self.side_panel.comment_text:
+        if self.side_panel.comment_text:
+            self.side_panel.comment_text.config(state=tk.NORMAL)
             self.side_panel.comment_text.delete("1.0", tk.END)
+            self.side_panel.comment_text.config(state=tk.DISABLED)
 
-        # If we have a current image, update its comment to empty
         if self.image_files and self.current_index < len(self.image_files):
             current_file = self.image_files[self.current_index]
-            self.comments[current_file] = ""
+            self.comments.pop(current_file, None)  # Remove the comment from storage
 
-        # Update character count
-        if hasattr(self, 'update_char_count'):
-            self.update_char_count()
-
-        # Update recent comments list
-        if hasattr(self, 'recent_comments') and self.recent_comments:
+        self.update_char_count()
+        if self.recent_comments:
             self.update_recent_comments_list()
 
     def update_char_count(self, event=None):
@@ -1307,29 +1296,60 @@ class ImageReviewApp:
             self.char_count_var.set(f"{count} characters")
             self.persistent_comment_text.edit_modified(False)  # Reset the modified flag
 
-    def load_new_image(self):
-        """Load and display a new image with proper comment clearing"""
+    def load_comments_from_temp(self):
+        """Load comments from the temp file if it matches the current dataset"""
+        if not os.path.exists(self.temp_comments_file):
+            self.comments = {}
+            return
+
+        try:
+            with open(self.temp_comments_file, 'r') as f:
+                data = json.load(f)
+                saved_image_dir = data.get("image_dir", "")
+                saved_hash = data.get("image_files_hash", "")
+                saved_comments = data.get("comments", {})
+
+                # Only load if image_dir is set and matches (or will match after load_data)
+                if self.image_dir and self.image_dir == saved_image_dir:
+                    if self.image_files and self._get_image_files_hash() == saved_hash:
+                        self.comments = saved_comments
+                        print(f"Loaded {len(self.comments)} comments from temp file")
+                    else:
+                        self.comments = {}
+                        print("Dataset mismatch; comments not loaded")
+                else:
+                    # Defer loading until load_data sets image_dir and image_files
+                    self.last_image_dir = saved_image_dir
+                    self.last_image_files_hash = saved_hash
+                    self.comments = saved_comments if saved_image_dir else {}
+        except Exception as e:
+            print(f"Failed to load comments from temp file: {e}")
+            self.comments = {}
+
+    def load_new_image(self, save_current=True):
         if not self.image_files:
             return
 
-        # Save the current comment before changing image
-        self.save_comment()
-
-        # Show loading indicator
-        self.canvas.delete("all")
-        loading_text = self.canvas.create_text(
-            self.canvas_width // 2,
-            self.canvas_height // 2,
-            text="Loading image...",
-            font=("Helvetica", 12),
-            fill="#555555"
-        )
-        self.canvas.update()
-
-        current_file = self.image_files[self.current_index]
-        image_path = os.path.join(self.image_dir, current_file)
-
+        self._is_navigating = True
         try:
+            # Clear the text box immediately
+            if self.persistent_comment_text:
+                self.persistent_comment_text.delete("1.0", tk.END)
+
+            # Show loading indicator
+            self.canvas.delete("all")
+            loading_text = self.canvas.create_text(
+                self.canvas_width // 2,
+                self.canvas_height // 2,
+                text="Loading image...",
+                font=("Helvetica", 12),
+                fill="#555555"
+            )
+            self.canvas.update()
+
+            current_file = self.image_files[self.current_index]
+            image_path = os.path.join(self.image_dir, current_file)
+
             self.base_cv_image = cv2.imread(image_path)
             if self.base_cv_image is None:
                 messagebox.showerror("Error", f"Failed to load image: {current_file}")
@@ -1339,128 +1359,113 @@ class ImageReviewApp:
             h, w = self.base_cv_image.shape[:2]
             self.image_info.config(text=f"Image: {current_file} ({w}×{h})")
 
-            # Reset highlight
             self.highlighted_annotation_index = None
-
-            # Calculate best zoom to fit
             orig_h, orig_w = self.base_cv_image.shape[:2]
             base_zoom = min(self.canvas_width / orig_w, self.canvas_height / orig_h, 1.0)
             self.zoom_factor = base_zoom
             new_w = int(orig_w * self.zoom_factor)
             new_h = int(orig_h * self.zoom_factor)
-
-            # Center the image
             self.pan_x = (self.canvas_width - new_w) // 2
             self.pan_y = (self.canvas_height - new_h) // 2
 
-            # Update zoom label
             self.update_zoom_label()
-
-            # Update image counter
             self.update_counter()
-
-            # Update annotation panel
             self.update_annotation_list()
-
-            # Refresh the image display
             self.refresh_image()
+            self.current_image_var.set(f"Image: {current_file}")
 
-            # Update current image name in the comments pane
-            if hasattr(self, 'current_image_var'):
-                self.current_image_var.set(f"Image: {current_file}")
-
-            # CRITICAL: Get the comment for this image (or empty string if none)
+            # Load only the saved comment for this image
             comment_to_load = self.comments.get(current_file, "")
-
-            # CRITICAL: Clear and update persistent comment text
-            # This must be done directly with the widget attribute, not through comment_text
-            if hasattr(self, 'persistent_comment_text') and self.persistent_comment_text:
-                self.persistent_comment_text.delete("1.0", tk.END)  # Clear completely
+            if self.persistent_comment_text:
+                self.persistent_comment_text.delete("1.0", tk.END)  # Ensure cleared
                 if comment_to_load:
                     self.persistent_comment_text.insert(tk.END, comment_to_load)
+                    print(f"Loaded comment '{comment_to_load}' for {current_file}")
+                else:
+                    print(f"No saved comment for {current_file}")
 
-            # Also update side panel comment text if it exists
-            if hasattr(self.side_panel, 'comment_text') and self.side_panel.comment_text:
-                self.side_panel.comment_text.delete("1.0", tk.END)  # Clear completely
+            if self.side_panel.comment_text:
+                self.side_panel.comment_text.config(state=tk.NORMAL)
+                self.side_panel.comment_text.delete("1.0", tk.END)
                 if comment_to_load:
                     self.side_panel.comment_text.insert(tk.END, comment_to_load)
+                self.side_panel.comment_text.config(state=tk.DISABLED)
 
-            # Update character count
-            if hasattr(self, 'update_char_count'):
-                self.update_char_count()
-
-            # Update recent comments list if available
-            if hasattr(self, 'recent_comments') and self.recent_comments:
+            self.update_char_count()
+            if self.recent_comments:
                 self.update_recent_comments_list()
 
         except Exception as e:
             messagebox.showerror("Error", f"Error loading image {current_file}: {str(e)}")
-            print(f"Error loading image: {str(e)}")  # Additional console debug info
+            print(f"Error loading image: {str(e)}")
+        finally:
+            self._is_navigating = False
 
-    def save_comment(self):
-        """Save the current comment from whichever text area was last used"""
+    def save_comment(self, force_save=False):
         if not self.image_files:
             return
-
         current_file = self.image_files[self.current_index]
+        comment = self.persistent_comment_text.get("1.0", tk.END).strip()
+        if comment and (force_save or not self._is_navigating):
+            self.comments[current_file] = comment
+            print(f"Saved comment '{comment}' for {current_file} (explicit save)")
+            try:
+                with open(self.temp_comments_file, 'w') as f:
+                    json.dump({
+                        "image_dir": self.image_dir,
+                        "image_files_hash": self._get_image_files_hash(),
+                        "comments": self.comments
+                    }, f)
+            except Exception as e:
+                print(f"Failed to save comments to temp file: {e}")
+        elif not comment:
+            self.comments.pop(current_file, None)
 
-        # Initialize with empty comment
-        comment = ""
-        side_panel_comment = ""
-        persistent_comment = ""
-
-        # Get comment from the persistent comment pane
-        if hasattr(self, 'persistent_comment_text') and self.persistent_comment_text:
-            persistent_comment = self.persistent_comment_text.get("1.0", tk.END).strip()
-            comment = persistent_comment
-
-        # Get comment from the side panel
-        if hasattr(self.side_panel, 'comment_text') and self.side_panel.comment_text:
-            side_panel_comment = self.side_panel.comment_text.get("1.0", tk.END).strip()
-
-            # If side panel has newer content and is focused or was last modified
-            # (Note: This heuristic might need adjustment based on your exact UI interaction patterns)
-            focused_widget = self.root.focus_get()
-            if (focused_widget == self.side_panel.comment_text or
-                    (persistent_comment == self.comments.get(current_file,
-                                                             "") and side_panel_comment != persistent_comment)):
-                comment = side_panel_comment
-
-        # Save the comment
-        self.comments[current_file] = comment
-
-        # Synchronize both text areas
-        if hasattr(self, 'persistent_comment_text') and self.persistent_comment_text:
-            if self.persistent_comment_text.get("1.0", tk.END).strip() != comment:
-                self.persistent_comment_text.delete("1.0", tk.END)
-                self.persistent_comment_text.insert(tk.END, comment)
-
-        if hasattr(self.side_panel, 'comment_text') and self.side_panel.comment_text:
-            if self.side_panel.comment_text.get("1.0", tk.END).strip() != comment:
-                self.side_panel.comment_text.delete("1.0", tk.END)
+        if self.side_panel.comment_text:
+            self.side_panel.comment_text.config(state=tk.NORMAL)
+            self.side_panel.comment_text.delete("1.0", tk.END)
+            if comment and (force_save or not self._is_navigating):
                 self.side_panel.comment_text.insert(tk.END, comment)
-
-        # Update recent comments list if available
-        if hasattr(self, 'recent_comments') and self.recent_comments:
+            self.side_panel.comment_text.config(state=tk.DISABLED)
+        if self.recent_comments:
             self.update_recent_comments_list()
 
     def next_image(self):
-        """Navigate to the next image"""
-        if not self.image_files:
+        if not self.image_files or self.current_index >= len(self.image_files) - 1:
             return
-
-        if self.current_index < len(self.image_files) - 1:
-            self.current_index += 1
-            self.load_new_image()
+        if self.persistent_comment_text:
+            current_comment = self.persistent_comment_text.get("1.0", tk.END).strip()
+            if current_comment:
+                self.save_comment_for_previous(self.image_files[self.current_index])
+        self.current_index += 1
+        self.load_new_image(save_current=False)  # Disable save_current since we saved already
 
     def prev_image(self):
-        """Navigate to the previous image"""
+        if not self.image_files or self.current_index <= 0:
+            return
+        if self.persistent_comment_text:
+            current_comment = self.persistent_comment_text.get("1.0", tk.END).strip()
+            if current_comment:
+                self.save_comment_for_previous(self.image_files[self.current_index])
+        self.current_index -= 1
+        self.load_new_image(save_current=False)
+
+    def save_comment_for_previous(self, previous_file):
         if not self.image_files:
             return
-
-        if self.current_index > 0:
-            self.current_index -= 1
-            self.load_new_image()
+        comment = self.persistent_comment_text.get("1.0", tk.END).strip()
+        if comment:
+            self.comments[previous_file] = comment
+            print(f"Saved comment '{comment}' for {previous_file}")
+            try:
+                with open(self.temp_comments_file, 'w') as f:
+                    json.dump({
+                        "image_dir": self.image_dir,
+                        "image_files_hash": self._get_image_files_hash(),
+                        "comments": self.comments
+                    }, f)
+            except Exception as e:
+                print(f"Failed to save comments to temp file: {e}")
 
     def handle_tab_key(self, event):
         """Handle tab key in text widgets to allow focus navigation"""
@@ -1585,56 +1590,42 @@ class ImageReviewApp:
 
     def export_reviews(self):
         """Export comments to Excel with improved information"""
-        self.save_comment()  # Make sure current comment is saved
+        self.save_comment()  # Save the current comment before exporting
 
-        if not self.comments:
-            messagebox.showinfo("No Comments", "No comments to export.")
+        if not self.image_files:
+            messagebox.showinfo("No Data", "No images loaded to export.")
             return
 
-        # Gather comment data with additional information
+        # Gather data for all images, including those without comments
         data = []
-
         for image_file in self.image_files:
-            # Get annotation info
+            comment = self.comments.get(image_file, "")
             anns = self.annotations_by_filename.get(image_file, [])
-            ann_classes = []
-            for ann in anns:
-                cat_id = ann.get('category_id')
-                cat_label = self.categories.get(cat_id, str(cat_id))
-                if cat_label not in ann_classes:
-                    ann_classes.append(cat_label)
-
-            # Create entry with comment and annotation info
+            ann_classes = [self.categories.get(ann.get('category_id'), str(ann.get('category_id')))
+                           for ann in anns]
             data.append({
                 "image_name": image_file,
-                "comment": self.comments.get(image_file, ""),
-                "has_comment": image_file in self.comments and bool(self.comments[image_file].strip()),
+                "comment": comment,
+                "has_comment": bool(comment.strip()),
                 "annotation_count": len(anns),
-                "annotation_classes": ", ".join(ann_classes)
+                "annotation_classes": ", ".join(sorted(set(ann_classes)))
             })
 
         # Convert to DataFrame
         df = pd.DataFrame(data)
 
         try:
-            # Export to Excel with formatting
             with pd.ExcelWriter(self.output_excel, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False, sheet_name='Image Reviews')
-
-                # Get the workbook and the worksheet
-                workbook = writer.book
                 worksheet = writer.sheets['Image Reviews']
-
-                # Set column widths
                 worksheet.column_dimensions['A'].width = 25  # image_name
                 worksheet.column_dimensions['B'].width = 50  # comment
                 worksheet.column_dimensions['C'].width = 12  # has_comment
                 worksheet.column_dimensions['D'].width = 15  # annotation_count
                 worksheet.column_dimensions['E'].width = 30  # annotation_classes
-
             messagebox.showinfo("Export", f"Reviews exported to {self.output_excel}")
         except Exception as e:
-            messagebox.showerror("Export Error", str(e))
+            messagebox.showerror("Export Error", f"Failed to export reviews: {str(e)}")
 
     def generate_stats(self):
         total_images = len(self.image_files)
@@ -1774,6 +1765,7 @@ class ImageReviewApp:
 
     def on_closing(self):
         self.save_settings()
+        self.save_comment()
         self.root.destroy()
 
     def browse_ann_dir(self):
@@ -1823,14 +1815,10 @@ class ImageReviewApp:
         self.annotations_by_filename, self.categories = load_annotations(self.annotation_dir)
         self.category_colors = generate_category_colors(self.categories)
         self.side_panel.filtered_tab.populate_class_list(self.categories)
-        self.class_name_to_id = {}
+        self.class_name_to_id = {cat_name: cat_id for cat_id, cat_name in self.categories.items()}
         if self.categories:
-            class_names = []
-            for cat_id, cat_name in self.categories.items():
-                class_names.append(cat_name)
-                self.class_name_to_id[cat_name] = cat_id
-            self.heatmap_class_combobox['values'] = class_names
-            if class_names:
+            self.heatmap_class_combobox['values'] = list(self.categories.values())
+            if self.categories:
                 self.heatmap_class_combobox.current(0)
         valid_exts = ('.png', '.jpg', '.jpeg', '.bmp')
         self.image_files = sorted([f for f in os.listdir(self.image_dir)
@@ -1839,9 +1827,25 @@ class ImageReviewApp:
             messagebox.showerror("Error", "No images found in the image directory.")
             return
         self.current_index = 0
-        self.comments = {}
+
+        # Check if temp comments match the new dataset
+        current_hash = self._get_image_files_hash()
+        if (self.image_dir == self.last_image_dir and
+                current_hash == self.last_image_files_hash):
+            # Keep existing comments loaded from temp file
+            print(f"Retained {len(self.comments)} comments for matching dataset")
+        else:
+            self.comments = {}
+            print("New dataset detected; comments reset")
+
         self.update_counter()
         self.load_new_image()
+
+    def _get_image_files_hash(self):
+        """Generate a hash of the current image files list to detect changes"""
+        import hashlib
+        files_str = "".join(sorted(self.image_files))
+        return hashlib.md5(files_str.encode('utf-8')).hexdigest()
 
 #########################
 # Main Entry
