@@ -4,6 +4,8 @@ A Python-based desktop application for reviewing annotated images. It supports m
 VOC, YOLO, and WeedCOCO) and displays them over images in a practical three-pane layout. Built with Tkinter, it includes
 features to streamline the review process and analyze datasets effectively.
 
+![image](https://github.com/user-attachments/assets/44504f78-1c0e-44f0-abf8-4f64ace95451)
+
 ## Features
 
 - **Annotation Format Support:**  
