@@ -1,52 +1,63 @@
 # Image Review Tool
 
-A Python-based desktop application designed to help you review and analyze annotated images. Built with Tkinter and optimized with performance improvements, this tool loads COCO-format JSON annotations, overlays them on images, and provides interactive features like filtered cutouts, statistics, and heat maps. The modern, three-pane layout makes navigation and review both efficient and user-friendly.
+A Python-based desktop application for reviewing annotated images. It supports multiple annotation formats (COCO, PASCAL
+VOC, YOLO, and WeedCOCO) and displays them over images in a practical three-pane layout. Built with Tkinter, it includes
+features to streamline the review process and analyze datasets effectively.
 
----
+## Features
 
-## Key Features
+- **Annotation Format Support:**  
+  Loads annotations from various formats:
+    - **COCO:** JSON files with segmentation masks or bounding boxes.
+    - **PASCAL VOC:** XML files with bounding box annotations.
+    - **YOLO:** Text files with bounding boxes, dynamically reading image dimensions; supports an optional `labels.txt`
+      for class names.
+    - **WeedCOCO:** An extended COCO format with additional metadata like agricultural contexts, shown in a dedicated
+      tab.
 
-- **Image & Annotation Review:**  
-  Load images along with their corresponding COCO-format JSON annotations. View images with overlaid segmentation masks or bounding boxes and highlight specific annotations.
+- **Annotation Display:**  
+  Overlays annotations—bounding boxes or segmentation masks—on images, depending on what’s provided. Highlights specific
+  annotations when selected.
 
-- **Filtered View with Cutouts:**  
-  Dynamically filter and display cropped cutouts based on a selected annotation class. Thumbnails are cached and the layout is optimized with debounced resizing, ensuring smooth performance even with large datasets.
+- **Filtered Cutouts:**  
+  Filters images by annotation class and displays cropped thumbnails of annotated regions. Thumbnails are cached for
+  faster loading, and resizing is optimized to keep the interface responsive.
 
-- **Interactive Statistics & Heat Maps:**  
-  Generate interactive bar charts summarizing annotation counts per class. Create heat maps to visualize the spatial distribution of annotations across images, complete with embedded matplotlib navigation tools.
+- **Statistics and Heat Maps:**
+    - Bar charts summarize annotation counts per class, with interactive Matplotlib controls.
+    - Heat maps show the spatial distribution of annotations across images, useful for spotting patterns.
 
-- **Modern, Ergonomic UI:**  
-  A three-pane layout:
-  - **Left Panel:** Displays the list of annotations for the current image.
-  - **Center Panel:** Shows the main image with navigation and zoom controls.
-  - **Right Panel:** Contains a Notebook with tabs for loading data, filtered view, comments, statistics, and heat maps.
-  
-  The UI is built with themed `ttk` widgets for a more modern look.
+- **User Interface:**
+    - **Left Panel:** Lists annotations for the current image, with a filter option.
+    - **Center Panel:** Displays the main image with navigation, zoom controls, and a persistent comment section.
+    - **Right Panel:** Contains tabs:
+        - **Load Data:** Set image/annotation directories, output file, and annotation type.
+        - **Filtered:** View class-specific cutouts.
+        - **Comments:** Add and review notes per image.
+        - **Stats:** Generate annotation statistics.
+        - **Heat Map:** Visualize annotation placement.
+        - **Metadata:** Display WeedCOCO-specific details (e.g., agricultural context).
 
-- **Persistent Settings:**  
-  Save and load configuration settings (annotations directory, images directory, and output Excel file) using a file in the user's home directory. An explicit "Save Settings" button allows you to deliberately store your configuration for future sessions.
+- **Persistent Settings and Comments:**  
+  Saves configuration (directories and output file) to a settings file in your home directory. Comments are stored in a
+  temporary JSON file and persist across sessions, linked to the dataset.
 
-- **Performance Optimizations:**  
-  - **Thumbnail Caching:** Avoids reprocessing cutouts by caching generated thumbnails.
-  - **Debounced Resizing:** Reduces layout recalculations during rapid window resizes, ensuring smoother performance.
-
-- **Export Reviews:**  
-  Easily export comments and review data to an Excel file for further analysis or record-keeping.
-
----
+- **Export Functionality:**  
+  Exports comments, annotation counts, and class details to an Excel file for further analysis.
 
 ## Installation
 
 ### Requirements
 
 - Python 3.x
-- Tkinter (usually comes bundled with Python)
-- [OpenCV](https://opencv.org/) (`opencv-python`)
-- [Pillow](https://python-pillow.org/)
-- [Pandas](https://pandas.pydata.org/)
-- [Matplotlib](https://matplotlib.org/)
+- Tkinter (typically included with Python)
+- `opencv-python`
+- `Pillow`
+- `pandas`
+- `matplotlib`
+- `numpy`
 
-### Installation via pip
+### Install Dependencies
 
 ```bash
-pip install opencv-python Pillow pandas matplotlib
+pip install opencv-python Pillow pandas matplotlib numpy
