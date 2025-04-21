@@ -175,7 +175,9 @@ class FilteredViewTab:
         self.resize_after_id = None  # for debouncing
         self.loading_task_id = None  # for cancelling loading tasks
         self.is_loading = False  # flag to prevent multiple concurrent loads
-        self.max_thumbnails = 100  # limit thumbnails to prevent memory issues
+        self.max_thumbnails = 100  # limit thumbnails per page
+        self.current_page = 0  # current page of thumbnails
+        self.total_pages = 0  # total pages of thumbnails
         self.frame = ttk.Frame(self.parent)
         self.parent.add(self.frame, text="Filtered")
         self.create_tab()
@@ -191,16 +193,16 @@ class FilteredViewTab:
         self.class_combobox.pack(side=tk.LEFT, padx=5)
         self.class_combobox.bind("<<ComboboxSelected>>", self.update_filtered_images)
 
-        # Add a loading indicator and limit control
-        limit_frame = ttk.Frame(control_frame)
-        limit_frame.pack(side=tk.RIGHT, padx=5)
+        # Add sort control
+        sort_frame = ttk.Frame(control_frame)
+        sort_frame.pack(side=tk.RIGHT, padx=5)
 
-        ttk.Label(limit_frame, text="Max thumbnails:", font=("Helvetica", 9)).pack(side=tk.LEFT)
-        self.limit_var = tk.StringVar(value=str(self.max_thumbnails))
-        limit_entry = ttk.Spinbox(limit_frame, from_=10, to=500, width=5,
-                                  textvariable=self.limit_var, increment=10)
-        limit_entry.pack(side=tk.LEFT, padx=5)
-        self.limit_var.trace("w", self.update_thumbnail_limit)
+        ttk.Label(sort_frame, text="Sort by:", font=("Helvetica", 9)).pack(side=tk.LEFT)
+        self.sort_var = tk.StringVar(value="None")
+        sort_combobox = ttk.Combobox(sort_frame, values=["None", "Size (Largest)", "Size (Smallest)"],
+                                     textvariable=self.sort_var, width=15, state="readonly")
+        sort_combobox.pack(side=tk.LEFT, padx=5)
+        self.sort_var.trace("w", self.update_filtered_images)
 
         # Status/count indicator
         self.status_var = tk.StringVar(value="Ready")
@@ -230,6 +232,49 @@ class FilteredViewTab:
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
+        # Enhanced pagination controls (single set)
+        self.pagination_frame = ttk.Frame(self.frame)
+        self.pagination_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        # Left side: Previous button
+        self.prev_page_btn = ttk.Button(self.pagination_frame, text="← Previous",
+                                        command=self.previous_page, state=tk.DISABLED)
+        self.prev_page_btn.pack(side=tk.LEFT, padx=5)
+
+        # Center: Page input controls
+        page_input_frame = ttk.Frame(self.pagination_frame)
+        page_input_frame.pack(side=tk.LEFT, padx=10)
+
+        # Page text and input
+        ttk.Label(page_input_frame, text="Page:").pack(side=tk.LEFT, padx=2)
+        self.page_entry = ttk.Entry(page_input_frame, width=5)
+        self.page_entry.pack(side=tk.LEFT, padx=2)
+        self.page_entry.bind("<Return>", self.go_to_page)
+        ttk.Label(page_input_frame, text="of").pack(side=tk.LEFT, padx=2)
+        self.page_total_label = ttk.Label(page_input_frame, text="0")
+        self.page_total_label.pack(side=tk.LEFT, padx=2)
+
+        # Go button
+        ttk.Button(page_input_frame, text="Go", width=3,
+                   command=self.go_to_page).pack(side=tk.LEFT, padx=2)
+
+        # Right side: Max thumbnails and Next button
+        right_controls = ttk.Frame(self.pagination_frame)
+        right_controls.pack(side=tk.RIGHT)
+
+        # Max thumbnails control (moved to pagination area)
+        ttk.Label(right_controls, text="Max per page:").pack(side=tk.LEFT)
+        self.limit_var = tk.StringVar(value=str(self.max_thumbnails))
+        limit_entry = ttk.Spinbox(right_controls, from_=10, to=500, width=5,
+                                  textvariable=self.limit_var, increment=10)
+        limit_entry.pack(side=tk.LEFT, padx=5)
+        self.limit_var.trace("w", self.update_thumbnail_limit)
+
+        # Next button
+        self.next_page_btn = ttk.Button(right_controls, text="Next →",
+                                        command=self.next_page, state=tk.DISABLED)
+        self.next_page_btn.pack(side=tk.LEFT, padx=5)
+
         # Add progress bar
         self.progress = ttk.Progressbar(self.frame, orient=tk.HORIZONTAL, mode='determinate')
         self.progress.pack(fill=tk.X, padx=10, pady=5)
@@ -241,6 +286,52 @@ class FilteredViewTab:
         # Handle canvas resize
         self.canvas.bind("<Configure>", self.on_canvas_resize)
 
+    def go_to_page(self, event=None):
+        """Navigate to a specific page entered by the user"""
+        try:
+            # Get user input
+            page_num = int(self.page_entry.get())
+
+            # Validate page number
+            if 1 <= page_num <= self.total_pages:
+                self.current_page = page_num - 1  # Convert to 0-based index
+                self.update_page()
+            else:
+                messagebox.showinfo("Invalid Page",
+                                    f"Please enter a page number between 1 and {self.total_pages}")
+        except ValueError:
+            messagebox.showinfo("Invalid Input", "Please enter a valid page number")
+
+    def previous_page(self):
+        """Go to the previous page of thumbnails"""
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_page()
+
+    def next_page(self):
+        """Go to the next page of thumbnails"""
+        if self.current_page < self.total_pages - 1:
+            self.current_page += 1
+            self.update_page()
+
+    def update_page(self):
+        """Update the current page of thumbnails"""
+        # Update page information
+        # self.page_info.config(text=f"Page {self.current_page + 1} of {self.total_pages}")  # This line causes the error
+
+        # Instead, update the page entry and total label
+        self.page_entry.delete(0, tk.END)
+        self.page_entry.insert(0, str(self.current_page + 1))
+        self.page_total_label.config(text=str(self.total_pages))
+
+        # Update button states
+        self.prev_page_btn.config(state=tk.NORMAL if self.current_page > 0 else tk.DISABLED)
+        self.next_page_btn.config(state=tk.NORMAL if self.current_page < self.total_pages - 1 else tk.DISABLED)
+
+        # Load thumbnails for current page
+        class_id = self.app.class_name_to_id.get(self.selected_class)
+        self.display_cropped_instances(class_id)
+
     def clear_thumbnail_cache(self):
         """Clear the thumbnail cache to force regeneration"""
         self.thumbnail_cache.clear()
@@ -248,15 +339,58 @@ class FilteredViewTab:
             self.update_filtered_images(None)
         messagebox.showinfo("Cache Cleared", "Thumbnail cache has been cleared.")
 
+    def manage_cache(self):
+        """Clean up thumbnail cache if it gets too large"""
+        cache_size = len(self.thumbnail_cache)
+        if cache_size > 500:  # arbitrary limit, adjust as needed
+            # Keep only the most recent items by creating a new cache
+            current_class_id = self.app.class_name_to_id.get(self.selected_class)
+            keys_to_keep = []
+
+            # Prioritize keeping thumbnails for current class
+            for key in self.thumbnail_cache.keys():
+                if key[1] == current_class_id:
+                    keys_to_keep.append(key)
+
+            # Keep the 300 most recent entries
+            if len(keys_to_keep) > 300:
+                keys_to_keep = keys_to_keep[-300:]
+
+            # Create new cache with only the keys we want to keep
+            new_cache = {}
+            for key in keys_to_keep:
+                new_cache[key] = self.thumbnail_cache[key]
+
+            self.thumbnail_cache = new_cache
+            print(f"Cache cleaned: {cache_size} → {len(self.thumbnail_cache)} items")
+
     def update_thumbnail_limit(self, *args):
-        """Update the maximum number of thumbnails to display"""
+        """Update the maximum number of thumbnails to display per page"""
         try:
             new_limit = int(self.limit_var.get())
             if 10 <= new_limit <= 500:
+                old_limit = self.max_thumbnails
                 self.max_thumbnails = new_limit
-                # If already filtered, refresh the view
-                if self.selected_class:
-                    self.update_filtered_images(None)
+
+                # Only recalculate if we've already filtered
+                if hasattr(self, 'filtered_annotations') and self.filtered_annotations:
+                    # Calculate current position to try to keep same items visible
+                    old_start_idx = self.current_page * old_limit
+
+                    # Calculate new total pages
+                    total_items = len(self.filtered_annotations)
+                    self.total_pages = max(1, (total_items + self.max_thumbnails - 1) // self.max_thumbnails)
+
+                    # Try to keep same starting item visible
+                    self.current_page = min(old_start_idx // new_limit, self.total_pages - 1)
+
+                    # Update the display
+                    self.update_page_controls(self.current_page, self.total_pages)
+
+                    # If already filtered, refresh the view
+                    if self.selected_class:
+                        class_id = self.app.class_name_to_id.get(self.selected_class)
+                        self.display_cropped_instances(class_id)
         except ValueError:
             pass  # Ignore invalid inputs
 
@@ -272,8 +406,8 @@ class FilteredViewTab:
             class_id = self.app.class_name_to_id.get(self.selected_class)
             self.display_cropped_instances(class_id)
 
-    def update_filtered_images(self, event):
-        """Filter images by selected class"""
+    def update_filtered_images(self, *args):
+        """Filter images by selected class and sort if requested"""
         # Cancel any ongoing loading
         if self.loading_task_id:
             self.canvas.after_cancel(self.loading_task_id)
@@ -288,31 +422,77 @@ class FilteredViewTab:
         self.selected_class = self.class_combobox.get()
         if not self.selected_class:
             self.status_var.set("No class selected")
+            self.update_page_controls(0, 0)
             return
 
-        # Get class ID and filter images
+        # Get class ID
         class_id = self.app.class_name_to_id.get(self.selected_class)
-        self.filtered_images = [img for img in self.app.image_files if any(
-            ann["category_id"] == class_id for ann in self.app.annotations_by_filename.get(img, [])
-        )]
+
+        # Filter and calculate sizes
+        self.filtered_annotations = []
+
+        for img_file in self.app.image_files:
+            anns = self.app.annotations_by_filename.get(img_file, [])
+            for ann_index, ann in enumerate(anns):
+                if ann.get("category_id") == class_id:
+                    if "bbox" in ann and len(ann["bbox"]) == 4:
+                        x, y, w, h = map(int, ann["bbox"])
+                        area = w * h  # Calculate area in pixels
+                        self.filtered_annotations.append({
+                            'img_file': img_file,
+                            'ann_index': ann_index,
+                            'annotation': ann,
+                            'area': area
+                        })
+
+        # Sort if requested
+        sort_option = self.sort_var.get()
+        if sort_option == "Size (Largest)":
+            self.filtered_annotations.sort(key=lambda x: x['area'], reverse=True)
+        elif sort_option == "Size (Smallest)":
+            self.filtered_annotations.sort(key=lambda x: x['area'])
+
+        # Extract just the image files for backward compatibility
+        self.filtered_images = list(set(item['img_file'] for item in self.filtered_annotations))
 
         # Update status
-        if not self.filtered_images:
+        if not self.filtered_annotations:
             self.status_var.set(f"No images contain annotations for '{self.selected_class}'")
+            self.update_page_controls(0, 0)
             return
+
+        # Calculate total pages
+        total_items = len(self.filtered_annotations)
+        self.total_pages = max(1, (total_items + self.max_thumbnails - 1) // self.max_thumbnails)
+        self.current_page = 0
+
+        # Update page controls
+        self.update_page_controls(self.current_page, self.total_pages)
 
         # Set progress bar
         self.progress['value'] = 0
-        self.progress['maximum'] = min(len(self.filtered_images), self.max_thumbnails)
+        self.progress['maximum'] = min(self.max_thumbnails, total_items)
+
+        # Clean up cache periodically
+        self.manage_cache()
 
         # Start loading thumbnails
         self.is_loading = True
-        self.status_var.set(
-            f"Loading {min(len(self.filtered_images), self.max_thumbnails)} thumbnails of {len(self.filtered_images)} images...")
+        self.status_var.set(f"Loading page {self.current_page + 1} of {self.total_pages}...")
         self.display_cropped_instances(class_id)
 
+    def update_page_controls(self, current_page, total_pages):
+        """Update page controls with current state"""
+        self.page_total_label.config(text=str(total_pages))
+        self.page_entry.delete(0, tk.END)
+        self.page_entry.insert(0, str(current_page + 1))
+
+        # Update button states
+        self.prev_page_btn.config(state=tk.NORMAL if current_page > 0 else tk.DISABLED)
+        self.next_page_btn.config(state=tk.NORMAL if current_page < total_pages - 1 else tk.DISABLED)
+
     def display_cropped_instances(self, class_id):
-        """Display cropped instances with limited batch loading for performance"""
+        """Display cropped instances with paged loading and sorting"""
         if not self.is_loading:
             # Initial setup for loading
             for widget in self.scrollable_frame.winfo_children():
@@ -325,148 +505,162 @@ class FilteredViewTab:
         # Calculate grid layout
         max_columns = max(1, min(10, self.canvas.winfo_width() // 110))
 
-        # Begin or continue loading
-        self.load_batch(class_id, 0, 0, max_columns, 0)
+        # Begin loading with page offset
+        self.load_batch(class_id, 0, 0, max_columns, 0, 0)
 
-    def load_batch(self, class_id, row, col, max_columns, loaded_count):
-        """Load a batch of thumbnails with controlled timing"""
-        # Limit total thumbnails
-        if loaded_count >= self.max_thumbnails or loaded_count >= len(self.filtered_images):
+    def load_batch(self, class_id, row, col, max_columns, loaded_count, page_start):
+        """Load a batch of thumbnails with paging and sorting support"""
+        # Check if canvas is still visible
+        if not self.canvas.winfo_ismapped():
             self.is_loading = False
-            self.status_var.set(f"Showing {loaded_count} thumbnails from {len(self.filtered_images)} images")
-            self.progress['value'] = self.progress['maximum']
             return
 
-        # Get the current image file
-        img_file = self.filtered_images[loaded_count]
-        img_path = os.path.join(self.app.image_dir, img_file)
+        # Calculate the range of items to display on this page
+        page_start_idx = self.current_page * self.max_thumbnails
+        page_end_idx = min(page_start_idx + self.max_thumbnails, len(self.filtered_annotations))
 
-        try:
-            # Get annotations for this class in this image
-            matching_annotations = []
-            for ann_index, ann in enumerate(self.app.annotations_by_filename.get(img_file, [])):
-                if ann.get("category_id") == class_id:
-                    matching_annotations.append((ann_index, ann))
+        # Get the items for this page
+        page_items = self.filtered_annotations[page_start_idx:page_end_idx]
 
-            if matching_annotations:
-                # Only load the image once for all annotations
-                image = cv2.imread(img_path)
-                if image is None:
-                    # Skip if image can't be loaded
-                    self.loading_task_id = self.canvas.after(10,
-                                                             lambda: self.load_batch(class_id, row, col, max_columns,
-                                                                                     loaded_count + 1))
-                    return
+        thumbnails_created = 0
 
-                # Process up to 5 annotations per image to avoid overloading
-                for ann_index, ann in matching_annotations[:5]:
-                    # Create a unique cache key including class_id to avoid mixed thumbnails
-                    cache_key = (img_file, class_id, ann_index)
+        # Process each annotation in this page
+        for item in page_items:
+            img_file = item['img_file']
+            ann_index = item['ann_index']
+            ann = item['annotation']
+            area = item.get('area', 0)
 
-                    # Use cached thumbnail if available
-                    if cache_key in self.thumbnail_cache:
-                        tk_img = self.thumbnail_cache[cache_key]
+            try:
+                # Create a unique cache key
+                cache_key = (img_file, class_id, ann_index)
+
+                # Use cached thumbnail if available
+                if cache_key in self.thumbnail_cache:
+                    tk_img = self.thumbnail_cache[cache_key]
+                else:
+                    # Load the image if needed
+                    img_path = os.path.join(self.app.image_dir, img_file)
+                    image = cv2.imread(img_path)
+                    if image is None:
+                        continue
+
+                    # Create thumbnail (same code as before)
+                    if "bbox" in ann and len(ann["bbox"]) == 4:
+                        x, y, w, h = map(int, ann["bbox"])
+
+                        # Make sure the bbox coordinates are valid
+                        img_h, img_w = image.shape[:2]
+                        x = max(0, min(x, img_w - 1))
+                        y = max(0, min(y, img_h - 1))
+                        w = max(1, min(w, img_w - x))
+                        h = max(1, min(h, img_h - y))
+
+                        # Add small margin for visibility
+                        x_margin = max(0, x - 5)
+                        y_margin = max(0, y - 5)
+                        w_margin = min(w + 10, img_w - x_margin)
+                        h_margin = min(h + 10, img_h - y_margin)
+
+                        # Extract the cropped region
+                        cropped = image[y_margin:y_margin + h_margin, x_margin:x_margin + w_margin].copy()
+
+                        # Skip invalid crops
+                        if cropped.size == 0 or cropped is None:
+                            continue
+
+                        # Draw a rectangle on the crop to highlight the actual annotation
+                        rect_x = x - x_margin
+                        rect_y = y - y_margin
+                        cv2.rectangle(cropped, (rect_x, rect_y),
+                                      (rect_x + w, rect_y + h), (0, 255, 0), 1)
+
+                        # Convert and resize
+                        cropped = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
+                        pil_img = Image.fromarray(cropped)
+
+                        # Calculate aspect ratio for better thumbnail
+                        aspect = w_margin / h_margin if h_margin > 0 else 1
+                        if aspect > 1.5:  # Wide image
+                            thumb_w, thumb_h = 100, int(100 / aspect)
+                        elif aspect < 0.67:  # Tall image
+                            thumb_w, thumb_h = int(100 * aspect), 100
+                        else:  # Roughly square
+                            thumb_w, thumb_h = 100, 100
+
+                        # Resize the image
+                        try:
+                            pil_img = pil_img.resize((thumb_w, thumb_h), Image.LANCZOS)
+                        except AttributeError:
+                            # Fall back for older PIL versions
+                            pil_img = pil_img.resize((thumb_w, thumb_h), Image.ANTIALIAS)
+
+                        # Create a new square image with white background
+                        square_img = Image.new('RGB', (100, 100), (240, 240, 240))
+                        paste_x = (100 - thumb_w) // 2
+                        paste_y = (100 - thumb_h) // 2
+                        square_img.paste(pil_img, (paste_x, paste_y))
+
+                        # Convert to Tkinter PhotoImage
+                        tk_img = ImageTk.PhotoImage(square_img)
+                        self.thumbnail_cache[cache_key] = tk_img
                     else:
-                        # Create thumbnail from the annotation bounding box
-                        if "bbox" in ann and len(ann["bbox"]) == 4:
-                            x, y, w, h = map(int, ann["bbox"])
+                        continue  # Skip annotations without bbox
 
-                            # Make sure the bbox coordinates are valid
-                            img_h, img_w = image.shape[:2]
-                            x = max(0, min(x, img_w - 1))
-                            y = max(0, min(y, img_h - 1))
-                            w = max(1, min(w, img_w - x))
-                            h = max(1, min(h, img_h - y))
+                # Create frame to hold thumbnail and label
+                thumb_frame = ttk.Frame(self.scrollable_frame)
+                thumb_frame.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
 
-                            # Add small margin for visibility
-                            x_margin = max(0, x - 5)
-                            y_margin = max(0, y - 5)
-                            w_margin = min(w + 10, img_w - x_margin)
-                            h_margin = min(h + 10, img_h - y_margin)
+                # Create thumbnail button
+                btn = ttk.Button(thumb_frame, image=tk_img,
+                                 command=lambda f=img_file, a=ann: self.navigate_to_instance(f, a))
+                btn.pack(pady=(0, 2))
 
-                            # Extract the cropped region
-                            try:
-                                cropped = image[y_margin:y_margin + h_margin, x_margin:x_margin + w_margin].copy()
+                # Create label frame to show filename and size
+                label_frame = ttk.Frame(thumb_frame)
+                label_frame.pack(fill=tk.X)
 
-                                # Skip invalid crops
-                                if cropped.size == 0 or cropped is None:
-                                    continue
+                # Add small label with filename
+                ttk.Label(label_frame, text=img_file[:12] + "..." if len(img_file) > 15 else img_file,
+                          font=("Helvetica", 8)).pack(side=tk.LEFT)
 
-                                # Draw a rectangle on the crop to highlight the actual annotation
-                                rect_x = x - x_margin
-                                rect_y = y - y_margin
-                                cv2.rectangle(cropped, (rect_x, rect_y),
-                                              (rect_x + w, rect_y + h), (0, 255, 0), 1)
+                # Add size label if sorting by size
+                if self.sort_var.get() != "None":
+                    size_label = ttk.Label(label_frame, text=f"{area:,}px",
+                                           font=("Helvetica", 7), foreground="#555555")
+                    size_label.pack(side=tk.RIGHT)
 
-                                # Convert and resize
-                                cropped = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
-                                pil_img = Image.fromarray(cropped)
+                # Store reference to prevent garbage collection
+                self.instance_images.append(tk_img)
 
-                                # Calculate aspect ratio for better thumbnail
-                                aspect = w_margin / h_margin if h_margin > 0 else 1
-                                if aspect > 1.5:  # Wide image
-                                    thumb_w, thumb_h = 100, int(100 / aspect)
-                                elif aspect < 0.67:  # Tall image
-                                    thumb_w, thumb_h = int(100 * aspect), 100
-                                else:  # Roughly square
-                                    thumb_w, thumb_h = 100, 100
+                # Update grid position
+                col += 1
+                if col >= max_columns:
+                    col = 0
+                    row += 1
 
-                                # Resize the image
-                                try:
-                                    pil_img = pil_img.resize((thumb_w, thumb_h), Image.LANCZOS)
-                                except AttributeError:
-                                    # Fall back for older PIL versions
-                                    pil_img = pil_img.resize((thumb_w, thumb_h), Image.ANTIALIAS)
+                # Update counters
+                thumbnails_created += 1
 
-                                # Create a new square image with white background (for consistent thumbnails)
-                                square_img = Image.new('RGB', (100, 100), (240, 240, 240))
-                                paste_x = (100 - thumb_w) // 2
-                                paste_y = (100 - thumb_h) // 2
-                                square_img.paste(pil_img, (paste_x, paste_y))
-
-                                # Convert to Tkinter PhotoImage
-                                tk_img = ImageTk.PhotoImage(square_img)
-                                self.thumbnail_cache[cache_key] = tk_img
-                            except Exception as e:
-                                print(f"Error creating thumbnail for {img_file}, annotation {ann_index}: {e}")
-                                continue
-                        else:
-                            continue  # Skip annotations without bbox
-
-                    # Create frame to hold thumbnail and label
-                    thumb_frame = ttk.Frame(self.scrollable_frame)
-                    thumb_frame.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
-
-                    # Create thumbnail button
-                    btn = ttk.Button(thumb_frame, image=tk_img,
-                                     command=lambda f=img_file, a=ann: self.navigate_to_instance(f, a))
-                    btn.pack(pady=(0, 2))
-
-                    # Add small label with filename
-                    ttk.Label(thumb_frame, text=img_file[:12] + "..." if len(img_file) > 15 else img_file,
-                              font=("Helvetica", 8)).pack()
-
-                    # Store reference to prevent garbage collection
-                    self.instance_images.append(tk_img)
-
-                    # Update grid position
-                    col += 1
-                    if col >= max_columns:
-                        col = 0
-                        row += 1
-        except Exception as e:
-            # Log error but continue with other images
-            print(f"Error processing {img_file}: {str(e)}")
-
-        # Move to next image
-        loaded_count += 1
+            except Exception as e:
+                # Log error but continue with other images
+                print(f"Error processing {img_file}: {str(e)}")
 
         # Update progress
-        self.progress['value'] = loaded_count
+        self.progress['value'] = thumbnails_created
 
-        # Schedule next batch with a slight delay to keep UI responsive
-        self.loading_task_id = self.canvas.after(10,
-                                                 lambda: self.load_batch(class_id, row, col, max_columns, loaded_count))
+        # Update status
+        if thumbnails_created == 0 and self.total_pages > 0:
+            self.status_var.set(f"No thumbnails on this page. Try another page.")
+        else:
+            total_annotations = len(self.filtered_annotations)
+            start_idx = page_start_idx + 1
+            end_idx = page_start_idx + thumbnails_created
+            self.status_var.set(
+                f"Showing annotations {start_idx}-{end_idx} of {total_annotations} (page {self.current_page + 1} of {self.total_pages})")
+
+        # Finish loading
+        self.is_loading = False
 
     def navigate_to_instance(self, img_file, annotation):
         """Navigate to the selected instance, explicitly saving comments first"""
