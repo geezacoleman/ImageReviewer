@@ -199,8 +199,10 @@ class FilteredViewTab:
 
         ttk.Label(sort_frame, text="Sort by:", font=("Helvetica", 9)).pack(side=tk.LEFT)
         self.sort_var = tk.StringVar(value="None")
-        sort_combobox = ttk.Combobox(sort_frame, values=["None", "Size (Largest)", "Size (Smallest)"],
-                                     textvariable=self.sort_var, width=15, state="readonly")
+        sort_combobox = ttk.Combobox(sort_frame,
+                                     values=["None", "Size (Largest)", "Size (Smallest)",
+                                             "Color", "Green Channel", "Green Dominance", "Texture"],
+                                     textvariable=self.sort_var, width=20, state="readonly")
         sort_combobox.pack(side=tk.LEFT, padx=5)
         self.sort_var.trace("w", self.update_filtered_images)
 
@@ -428,32 +430,104 @@ class FilteredViewTab:
         # Get class ID
         class_id = self.app.class_name_to_id.get(self.selected_class)
 
-        # Filter and calculate sizes
+        # Show progress for feature extraction if sorting by color or texture
+        sort_option = self.sort_var.get()
+        show_progress = sort_option != "None"
+
+        if show_progress:
+            progress_window = tk.Toplevel(self.app.root)
+            progress_window.title("Extracting Features")
+            progress_window.geometry("400x100")
+            progress_window.transient(self.app.root)
+            progress_window.grab_set()
+
+            ttk.Label(progress_window, text=f"Extracting features for {sort_option} sorting...",
+                      font=("Helvetica", 11)).pack(pady=10)
+
+            progress = ttk.Progressbar(progress_window, mode='determinate')
+            progress.pack(fill=tk.X, padx=20, pady=10)
+
+            # Count how many annotations we'll process
+            annotation_count = 0
+            for img_file in self.app.image_files:
+                anns = self.app.annotations_by_filename.get(img_file, [])
+                for ann in anns:
+                    if ann.get("category_id") == class_id:
+                        annotation_count += 1
+
+            progress['maximum'] = annotation_count
+            progress_count = 0
+            progress_window.update()
+
+        # Filter and calculate features
         self.filtered_annotations = []
 
+        # Process all annotations for the selected class
         for img_file in self.app.image_files:
             anns = self.app.annotations_by_filename.get(img_file, [])
+
             for ann_index, ann in enumerate(anns):
                 if ann.get("category_id") == class_id:
-                    if "bbox" in ann and len(ann["bbox"]) == 4:
-                        x, y, w, h = map(int, ann["bbox"])
-                        area = w * h  # Calculate area in pixels
-                        self.filtered_annotations.append({
-                            'img_file': img_file,
-                            'ann_index': ann_index,
-                            'annotation': ann,
-                            'area': area
-                        })
+                    # Create annotation item with basic info
+                    item = {
+                        'img_file': img_file,
+                        'ann_index': ann_index,
+                        'annotation': ann
+                    }
 
-        # Sort if requested
-        sort_option = self.sort_var.get()
+                    # Extract features if needed for sorting
+                    if sort_option != "None":
+                        img_path = os.path.join(self.app.image_dir, img_file)
+                        features = self.extract_features_from_segmentation(img_path, ann)
+
+                        if features:
+                            item.update(features)
+
+                        # Update progress
+                        if show_progress:
+                            progress_count += 1
+                            if progress_count % 5 == 0:  # Update every 5 items
+                                progress['value'] = progress_count
+                                progress_window.update()
+
+                    self.filtered_annotations.append(item)
+
+        # Close progress window if open
+        if show_progress:
+            progress_window.destroy()
+
+        # Sort based on selected option
         if sort_option == "Size (Largest)":
-            self.filtered_annotations.sort(key=lambda x: x['area'], reverse=True)
+            self.filtered_annotations.sort(key=lambda x: x.get('area', 0), reverse=True)
         elif sort_option == "Size (Smallest)":
-            self.filtered_annotations.sort(key=lambda x: x['area'])
-
-        # Extract just the image files for backward compatibility
-        self.filtered_images = list(set(item['img_file'] for item in self.filtered_annotations))
+            self.filtered_annotations.sort(key=lambda x: x.get('area', 0))
+        elif sort_option == "Color":
+            # Sort by overall color brightness (weighted RGB)
+            self.filtered_annotations.sort(
+                key=lambda x: 0.299 * x.get('mean_color', [0])[0] +
+                              0.587 * x.get('mean_color', [0, 0])[1] +
+                              0.114 * x.get('mean_color', [0, 0, 0])[2]
+                if 'mean_color' in x else 0,
+                reverse=True
+            )
+        elif sort_option == "Green Channel":
+            # Sort specifically by green channel value
+            self.filtered_annotations.sort(
+                key=lambda x: x.get('green_channel', 0) if 'green_channel' in x else 0,
+                reverse=True
+            )
+        elif sort_option == "Green Dominance":
+            # Sort by how dominant the green is compared to other channels
+            self.filtered_annotations.sort(
+                key=lambda x: x.get('green_dominance', 0) if 'green_dominance' in x else 0,
+                reverse=True
+            )
+        elif sort_option == "Texture":
+            # Sort by texture complexity
+            self.filtered_annotations.sort(
+                key=lambda x: x.get('texture_avg', 0) if 'texture_avg' in x else 0,
+                reverse=True
+            )
 
         # Update status
         if not self.filtered_annotations:
@@ -522,64 +596,136 @@ class FilteredViewTab:
         # Get the items for this page
         page_items = self.filtered_annotations[page_start_idx:page_end_idx]
 
+        # Debug output
+        print(f"Attempting to load {len(page_items)} items on page {self.current_page + 1}")
+        if len(page_items) == 0:
+            print(f"No items found for this page. Total annotations: {len(self.filtered_annotations)}")
+            print(f"Page range: {page_start_idx} to {page_end_idx}")
+
         thumbnails_created = 0
 
         # Process each annotation in this page
-        for item in page_items:
-            img_file = item['img_file']
-            ann_index = item['ann_index']
-            ann = item['annotation']
-            area = item.get('area', 0)
-
+        for item_idx, item in enumerate(page_items):
             try:
+                img_file = item['img_file']
+                ann_index = item['ann_index']
+                ann = item['annotation']
+
+                print(f"Processing item {item_idx + 1}/{len(page_items)}: {img_file}, annotation {ann_index}")
+
                 # Create a unique cache key
                 cache_key = (img_file, class_id, ann_index)
 
                 # Use cached thumbnail if available
                 if cache_key in self.thumbnail_cache:
+                    print(f"Using cached thumbnail for {img_file}")
                     tk_img = self.thumbnail_cache[cache_key]
                 else:
-                    # Load the image if needed
+                    # Load the image
                     img_path = os.path.join(self.app.image_dir, img_file)
+                    print(f"Loading image from {img_path}")
                     image = cv2.imread(img_path)
                     if image is None:
+                        print(f"Failed to load image: {img_path}")
                         continue
 
-                    # Create thumbnail (same code as before)
-                    if "bbox" in ann and len(ann["bbox"]) == 4:
-                        x, y, w, h = map(int, ann["bbox"])
+                    print(f"Image loaded: {img_path}, shape: {image.shape}")
 
-                        # Make sure the bbox coordinates are valid
-                        img_h, img_w = image.shape[:2]
-                        x = max(0, min(x, img_w - 1))
-                        y = max(0, min(y, img_h - 1))
-                        w = max(1, min(w, img_w - x))
-                        h = max(1, min(h, img_h - y))
+                    # Check if annotation has bbox information
+                    if "bbox" not in ann or len(ann["bbox"]) != 4:
+                        print(f"No valid bbox in annotation: {ann}")
+                        # Try to use segmentation information if available
+                        if 'segmentation' in ann and ann['segmentation']:
+                            print(f"Found segmentation data, attempting to create bbox")
+                            # Try to create a bounding box from segmentation
+                            try:
+                                # Create a mask from segmentation
+                                img_h, img_w = image.shape[:2]
+                                mask = np.zeros((img_h, img_w), dtype=np.uint8)
 
-                        # Add small margin for visibility
-                        x_margin = max(0, x - 5)
-                        y_margin = max(0, y - 5)
-                        w_margin = min(w + 10, img_w - x_margin)
-                        h_margin = min(h + 10, img_h - y_margin)
+                                for seg in ann['segmentation']:
+                                    if not isinstance(seg, list) or len(seg) < 6:
+                                        continue
 
-                        # Extract the cropped region
-                        cropped = image[y_margin:y_margin + h_margin, x_margin:x_margin + w_margin].copy()
+                                    points = np.array(seg, dtype=np.float32).reshape(-1, 2)
+                                    points = np.clip(points, 0, [img_w - 1, img_h - 1])
+                                    points = points.astype(np.int32)
 
-                        # Skip invalid crops
-                        if cropped.size == 0 or cropped is None:
+                                    # Draw polygon on mask
+                                    cv2.fillPoly(mask, [points], 255)
+
+                                # Find contours in the mask
+                                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                                if contours:
+                                    # Get bounding rectangle of the largest contour
+                                    largest_contour = max(contours, key=cv2.contourArea)
+                                    x, y, w, h = cv2.boundingRect(largest_contour)
+
+                                    # Create a temporary bbox
+                                    ann['bbox'] = [x, y, w, h]
+                                    print(f"Created bbox from segmentation: {ann['bbox']}")
+                                else:
+                                    print("No contours found in segmentation data")
+                                    continue
+                            except Exception as seg_error:
+                                print(f"Error creating bbox from segmentation: {str(seg_error)}")
+                                continue
+                        else:
+                            print("No bbox or segmentation data available")
                             continue
 
-                        # Draw a rectangle on the crop to highlight the actual annotation
+                    # Now we should have a bbox to work with
+                    x, y, w, h = map(int, ann["bbox"])
+                    print(f"Using bbox: x={x}, y={y}, w={w}, h={h}")
+
+                    # Make sure the bbox coordinates are valid
+                    img_h, img_w = image.shape[:2]
+                    x = max(0, min(x, img_w - 1))
+                    y = max(0, min(y, img_h - 1))
+                    w = max(1, min(w, img_w - x))
+                    h = max(1, min(h, img_h - y))
+
+                    # Add small margin for visibility
+                    x_margin = max(0, x - 5)
+                    y_margin = max(0, y - 5)
+                    w_margin = min(w + 10, img_w - x_margin)
+                    h_margin = min(h + 10, img_h - y_margin)
+
+                    print(f"Cropping with margins: x={x_margin}, y={y_margin}, w={w_margin}, h={h_margin}")
+
+                    # Extract the cropped region
+                    try:
+                        cropped = image[y_margin:y_margin + h_margin, x_margin:x_margin + w_margin].copy()
+                        print(f"Cropped region shape: {cropped.shape}")
+                    except Exception as crop_error:
+                        print(f"Error cropping image {img_file}: {str(crop_error)}")
+                        continue
+
+                    # Skip invalid crops
+                    if cropped.size == 0 or cropped is None:
+                        print("Invalid crop: empty or None")
+                        continue
+
+                    try:
+                        # Draw a rectangle to highlight the annotation
                         rect_x = x - x_margin
                         rect_y = y - y_margin
                         cv2.rectangle(cropped, (rect_x, rect_y),
                                       (rect_x + w, rect_y + h), (0, 255, 0), 1)
 
-                        # Convert and resize
-                        cropped = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
-                        pil_img = Image.fromarray(cropped)
+                        # Convert BGR to RGB for PIL
+                        cropped_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
+                        print("Successfully converted to RGB")
 
-                        # Calculate aspect ratio for better thumbnail
+                        # Convert to PIL Image
+                        pil_img = Image.fromarray(cropped_rgb)
+                        print(f"Created PIL image: {pil_img.size}")
+                    except Exception as e:
+                        print(f"Error processing thumbnail for {img_file}: {str(e)}")
+                        continue
+
+                    # Calculate aspect ratio for thumbnail
+                    try:
                         aspect = w_margin / h_margin if h_margin > 0 else 1
                         if aspect > 1.5:  # Wide image
                             thumb_w, thumb_h = 100, int(100 / aspect)
@@ -588,26 +734,37 @@ class FilteredViewTab:
                         else:  # Roughly square
                             thumb_w, thumb_h = 100, 100
 
+                        print(f"Calculated thumbnail size: {thumb_w}x{thumb_h}")
+
                         # Resize the image
                         try:
-                            pil_img = pil_img.resize((thumb_w, thumb_h), Image.LANCZOS)
-                        except AttributeError:
+                            pil_img = pil_img.resize((thumb_w, thumb_h), Image.Resampling.LANCZOS)
+                        except (AttributeError, NameError):
                             # Fall back for older PIL versions
-                            pil_img = pil_img.resize((thumb_w, thumb_h), Image.ANTIALIAS)
+                            try:
+                                pil_img = pil_img.resize((thumb_w, thumb_h), Image.LANCZOS)
+                            except AttributeError:
+                                pil_img = pil_img.resize((thumb_w, thumb_h), Image.ANTIALIAS)
 
-                        # Create a new square image with white background
+                        print(f"Resized PIL image to: {pil_img.size}")
+
+                        # Create a square background
                         square_img = Image.new('RGB', (100, 100), (240, 240, 240))
                         paste_x = (100 - thumb_w) // 2
                         paste_y = (100 - thumb_h) // 2
                         square_img.paste(pil_img, (paste_x, paste_y))
+                        print("Created square thumbnail with background")
 
                         # Convert to Tkinter PhotoImage
                         tk_img = ImageTk.PhotoImage(square_img)
                         self.thumbnail_cache[cache_key] = tk_img
-                    else:
-                        continue  # Skip annotations without bbox
+                        print("Created Tkinter PhotoImage and cached it")
+                    except Exception as resize_error:
+                        print(f"Error resizing image {img_file}: {str(resize_error)}")
+                        continue
 
-                # Create frame to hold thumbnail and label
+                # Now create the UI component
+                print("Creating UI components for thumbnail")
                 thumb_frame = ttk.Frame(self.scrollable_frame)
                 thumb_frame.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
 
@@ -616,22 +773,47 @@ class FilteredViewTab:
                                  command=lambda f=img_file, a=ann: self.navigate_to_instance(f, a))
                 btn.pack(pady=(0, 2))
 
-                # Create label frame to show filename and size
+                # Create label frame
                 label_frame = ttk.Frame(thumb_frame)
                 label_frame.pack(fill=tk.X)
 
-                # Add small label with filename
-                ttk.Label(label_frame, text=img_file[:12] + "..." if len(img_file) > 15 else img_file,
+                # Add filename label
+                truncated_name = img_file[:12] + "..." if len(img_file) > 15 else img_file
+                ttk.Label(label_frame, text=truncated_name,
                           font=("Helvetica", 8)).pack(side=tk.LEFT)
 
-                # Add size label if sorting by size
-                if self.sort_var.get() != "None":
-                    size_label = ttk.Label(label_frame, text=f"{area:,}px",
+                # Add info based on sort type
+                sort_option = self.sort_var.get()
+                if sort_option in ["Size (Largest)", "Size (Smallest)"]:
+                    area = item.get('area', 0)
+                    info_label = ttk.Label(label_frame, text=f"{area:,}px",
                                            font=("Helvetica", 7), foreground="#555555")
-                    size_label.pack(side=tk.RIGHT)
+                    info_label.pack(side=tk.RIGHT)
+                elif sort_option == "Color" and 'mean_color' in item:
+                    mean_color = item['mean_color']
+                    rgb_text = f"RGB:{int(mean_color[0])},{int(mean_color[1])},{int(mean_color[2])}"
+
+                    # Create color preview
+                    color_frame = ttk.Frame(label_frame, width=10, height=10)
+                    color_frame.pack(side=tk.RIGHT, padx=2)
+                    style_name = f"Color{thumbnails_created}.TFrame"
+                    color_frame.configure(style=style_name)
+
+                    # Set style with background color
+                    rgb_hex = "#{:02x}{:02x}{:02x}".format(
+                        int(mean_color[0]), int(mean_color[1]), int(mean_color[2]))
+                    self.app.root.tk.call('ttk::style', 'configure', style_name, 'background', rgb_hex)
+
+                    # Add RGB text
+                    info_label = ttk.Label(label_frame, text=rgb_text,
+                                           font=("Helvetica", 7), foreground="#555555")
+                    info_label.pack(side=tk.RIGHT)
+                # Handle other sort options...
+                # [code for other sort options would go here]
 
                 # Store reference to prevent garbage collection
                 self.instance_images.append(tk_img)
+                print(f"Successfully added thumbnail #{thumbnails_created + 1}")
 
                 # Update grid position
                 col += 1
@@ -644,14 +826,19 @@ class FilteredViewTab:
 
             except Exception as e:
                 # Log error but continue with other images
-                print(f"Error processing {img_file}: {str(e)}")
+                print(
+                    f"Error processing item {item_idx} ({img_file if 'img_file' in locals() else 'unknown'}): {str(e)}")
+                import traceback
+                traceback.print_exc()
 
         # Update progress
         self.progress['value'] = thumbnails_created
+        print(f"Created {thumbnails_created} thumbnails")
 
         # Update status
         if thumbnails_created == 0 and self.total_pages > 0:
             self.status_var.set(f"No thumbnails on this page. Try another page.")
+            print("No thumbnails were created for this page.")
         else:
             total_annotations = len(self.filtered_annotations)
             start_idx = page_start_idx + 1
@@ -681,6 +868,274 @@ class FilteredViewTab:
         else:
             self.status_var.set("No categories available")
 
+    def compute_similarity(self, features1, features2):
+        """Compute similarity score between two feature sets"""
+        if features1 is None or features2 is None:
+            return 0
+
+        # 1. Color similarity (using Euclidean distance of mean colors)
+        color_dist = np.linalg.norm(np.array(features1['mean_color']) - np.array(features2['mean_color']))
+        color_sim = 1.0 / (1.0 + color_dist)
+
+        # 2. Histogram similarity (using histogram intersection)
+        hist1 = np.array(features1['color_hist'])
+        hist2 = np.array(features2['color_hist'])
+        hist_sim = np.sum(np.minimum(hist1, hist2))
+
+        # 3. Texture similarity
+        texture_dist = np.linalg.norm(np.array(features1['texture']) - np.array(features2['texture']))
+        texture_sim = 1.0 / (1.0 + texture_dist)
+
+        # Combined similarity (weighted average)
+        similarity = 0.4 * color_sim + 0.4 * hist_sim + 0.2 * texture_sim
+
+        return similarity
+
+    def extract_features_from_segmentation(self, image_path, annotation):
+        """Extract features from the actual segmentation area rather than the bounding box"""
+        try:
+            # Load the image
+            image = cv2.imread(image_path)
+            if image is None:
+                print(f"Failed to load image: {image_path}")
+                return None
+
+            img_h, img_w = image.shape[:2]
+
+            # Create a mask from the segmentation
+            mask = np.zeros((img_h, img_w), dtype=np.uint8)
+            mask_created = False
+
+            # Try to create mask from segmentation
+            if 'segmentation' in annotation and annotation['segmentation']:
+                try:
+                    for seg in annotation['segmentation']:
+                        if not isinstance(seg, list) or len(seg) < 6:  # Need at least 3 points
+                            continue
+
+                        # Convert to numpy array of points
+                        points = np.array(seg, dtype=np.float32).reshape(-1, 2)
+
+                        # Check for valid coordinates
+                        if np.any(points < 0) or np.any(points[:, 0] >= img_w) or np.any(points[:, 1] >= img_h):
+                            # Clip points to image boundaries
+                            points[:, 0] = np.clip(points[:, 0], 0, img_w - 1)
+                            points[:, 1] = np.clip(points[:, 1], 0, img_h - 1)
+
+                        points = points.astype(np.int32)
+
+                        # Draw the polygon on the mask (positional args only)
+                        cv2.fillPoly(mask, [points], 255)
+                        mask_created = True
+                except Exception as seg_error:
+                    print(f"Error processing segmentation in {image_path}: {str(seg_error)}")
+                    # Continue to fallback
+
+            # Fallback to bbox if no segmentation was created
+            if not mask_created and 'bbox' in annotation:
+                try:
+                    x, y, w, h = map(int, annotation['bbox'])
+                    # Ensure coordinates are valid
+                    x = max(0, min(x, img_w - 1))
+                    y = max(0, min(y, img_h - 1))
+                    w = max(1, min(w, img_w - x))
+                    h = max(1, min(h, img_h - y))
+
+                    # Create rectangular mask (all positional args)
+                    cv2.rectangle(mask, (x, y), (x + w, y + h), 255, -1)  # -1 means filled
+                    mask_created = True
+                except Exception as bbox_error:
+                    print(f"Error creating bbox mask in {image_path}: {str(bbox_error)}")
+
+            if not mask_created:
+                print(f"Failed to create any mask for {image_path}")
+                return None
+
+            # Check if mask has any non-zero pixels
+            if cv2.countNonZero(mask) == 0:
+                print(f"Mask is empty for {image_path}")
+                return None
+
+            # Apply the mask to the image (positional args only)
+            masked_image = cv2.bitwise_and(image, image, mask)
+
+            # Convert to RGB for better color analysis
+            masked_rgb = cv2.cvtColor(masked_image, cv2.COLOR_BGR2RGB)
+
+            # Extract only the non-zero pixels for calculations
+            non_zero_mask = mask > 0
+            pixels = masked_rgb[non_zero_mask]
+
+            if len(pixels) == 0:
+                print(f"No pixels in masked region for {image_path}")
+                return None
+
+            # Calculate features
+            mean_color = np.mean(pixels, axis=0)
+            texture = np.std(pixels, axis=0)
+            texture_avg = np.mean(texture)
+            area = len(pixels)
+
+            # Extract specific channels
+            r_channel = pixels[:, 0].mean()
+            g_channel = pixels[:, 1].mean()
+            b_channel = pixels[:, 2].mean()
+
+            # Calculate green metrics
+            g_percent = g_channel / 255.0  # Normalized green value
+
+            # Calculate green dominance ratio
+            if (r_channel + b_channel) > 0:
+                green_dominance = g_channel / ((r_channel + b_channel) / 2)
+            else:
+                green_dominance = 1.0
+
+            return {
+                'mean_color': np.array([r_channel, g_channel, b_channel]),
+                'texture': texture,
+                'texture_avg': texture_avg,
+                'area': area,
+                'green_channel': g_channel,
+                'g_percent': g_percent,
+                'green_dominance': green_dominance
+            }
+
+        except Exception as e:
+            print(f"Error extracting features for {image_path}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def extract_basic_features(self, image_path, bbox):
+        """Extract basic color and texture features from an annotation"""
+        try:
+            # Load the image
+            image = cv2.imread(image_path)
+            if image is None:
+                return None
+
+            # Extract the exact region of the annotation (no margin)
+            x, y, w, h = map(int, bbox)
+            img_h, img_w = image.shape[:2]
+
+            # Ensure coordinates are valid
+            x = max(0, min(x, img_w - 1))
+            y = max(0, min(y, img_h - 1))
+            w = max(1, min(w, img_w - x))
+            h = max(1, min(h, img_h - y))
+
+            # Extract the cutout - use exact annotation area
+            cutout = image[y:y + h, x:x + w]
+            if cutout.size == 0:
+                return None
+
+            # Convert to RGB
+            cutout_rgb = cv2.cvtColor(cutout, cv2.COLOR_BGR2RGB)
+
+            # Calculate mean color (RGB)
+            mean_color = cutout_rgb.mean(axis=(0, 1))
+
+            # Calculate texture (standard deviation of pixel values)
+            texture = cutout_rgb.std(axis=(0, 1))
+
+            # Calculate mean brightness (for sorting by brightness)
+            brightness = np.mean(mean_color)
+
+            # Calculate color variance (for vibrancy)
+            color_variance = np.var(mean_color)
+
+            return {
+                'mean_color': mean_color,
+                'texture': texture,
+                'brightness': brightness,
+                'color_variance': color_variance
+            }
+
+        except Exception as e:
+            print(f"Error extracting features: {e}")
+            return None
+
+    def compute_color_histogram(self, image, bins=8):
+        """Compute a color histogram with the specified number of bins per channel"""
+        hist = []
+        for i in range(3):  # RGB channels
+            channel_hist, _ = np.histogram(image[:, :, i], bins=bins, range=(0, 256))
+            # Normalize
+            channel_hist = channel_hist.astype(np.float32) / np.sum(channel_hist)
+            hist.extend(channel_hist)
+        return hist
+
+    def build_feature_database(self):
+        """Build a database of features for all class annotations"""
+        # Show a progress dialog
+        progress_window = tk.Toplevel(self.app.root)
+        progress_window.title("Building Feature Database")
+        progress_window.geometry("400x150")
+        progress_window.transient(self.app.root)
+        progress_window.grab_set()
+
+        ttk.Label(progress_window, text="Building feature database for similarity comparison...",
+                  font=("Helvetica", 11)).pack(pady=10)
+
+        progress = ttk.Progressbar(progress_window, mode='determinate')
+        progress.pack(fill=tk.X, padx=20, pady=10)
+
+        status_var = tk.StringVar(value="Initializing...")
+        status_label = ttk.Label(progress_window, textvariable=status_var)
+        status_label.pack(pady=5)
+
+        # Initialize database
+        self.feature_database = {}
+
+        # Count total annotations for progress
+        total_annotations = 0
+        for img_file in self.app.image_files:
+            total_annotations += len(self.app.annotations_by_filename.get(img_file, []))
+
+        progress['maximum'] = total_annotations
+        progress_window.update()
+
+        # Build the database
+        current_count = 0
+        for img_file in self.app.image_files:
+            img_path = os.path.join(self.app.image_dir, img_file)
+            annotations = self.app.annotations_by_filename.get(img_file, [])
+
+            for ann_index, ann in enumerate(annotations):
+                cat_id = ann.get("category_id")
+                class_name = self.app.categories.get(cat_id, str(cat_id))
+
+                if "bbox" in ann and len(ann["bbox"]) == 4:
+                    # Update progress and status
+                    current_count += 1
+                    if current_count % 10 == 0:  # Update UI periodically to avoid freezing
+                        progress['value'] = current_count
+                        status_var.set(f"Processing {img_file}: {current_count}/{total_annotations}")
+                        progress_window.update()
+
+                    # Extract features
+                    features = self.extract_features(img_path, ann["bbox"])
+
+                    if features:
+                        # Add to database
+                        if class_name not in self.feature_database:
+                            self.feature_database[class_name] = []
+
+                        self.feature_database[class_name].append({
+                            'img_file': img_file,
+                            'ann_index': ann_index,
+                            'features': features
+                        })
+
+        # Close progress window
+        progress['value'] = total_annotations
+        status_var.set("Feature database built successfully!")
+        progress_window.update()
+
+        # Add a delay so the user can see completion
+        progress_window.after(1000, progress_window.destroy)
+
+        return self.feature_database
 
 #########################
 # Side Panel (Notebook on Right)
