@@ -67,12 +67,6 @@ A Python-based desktop application for reviewing annotated images. It supports m
         - **Minor edits:** `Button` and  `Ctrl + N` keyboard shortcut for the minor edits.
         - **Layout:** Reduced the layout size compared to the original.
         - **Region selection text:** Added automatic text generation to get the region selection for the major and minor edits. For example: `Minor edits. Top left: (837,1736) and Bottom right: (1719,2472) image coordinates and area is [882x736]`. Supports multiple region selections.
-     
-- **Installer:**
-    - Added Windows `Image Reviewer.exe` installer to easily install the application on Windows OS.
-    - Cannot be accessed as a Desktop Shortcut or through the Start button.
-    - Opens the GUI application with a `Terminal` to display the progress.
-    - Clean, nice and easy installation for someone who are not familiar using the Python program.
 
 # Installation
 
