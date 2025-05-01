@@ -1,24 +1,30 @@
-import os
-import json
-import glob
-import cv2
-import numpy as np
 import colorsys
-import pandas as pd
+import glob
+import hashlib
+import json
+import os
+import tempfile
+import time
 import tkinter as tk
 import xml.etree.ElementTree as ET
 from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageTk
-import tempfile
+
+import cv2
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+import numpy as np
+import pandas as pd
+from joblib import Parallel, delayed
+from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
+                                               NavigationToolbar2Tk)
+from PIL import Image, ImageTk
+from tqdm import tqdm
 
 #########################
 # Helper Functions
 #########################
 
 
-def load_annotations(annotation_dir, annotation_type="COCO", image_dir="", yolo_labels_file=""):
+def load_annotations(annotation_dir, annotation_type="COCO", image_dir="", yolo_labels_file="", resize_enabled=False, resize_factor=1.0):
     annotations_by_filename = {}
     categories = {}
     image_id_to_filename = {}
@@ -94,21 +100,193 @@ def load_annotations(annotation_dir, annotation_type="COCO", image_dir="", yolo_
             if os.path.exists(image_path):
                 img = cv2.imread(image_path)
                 if img is not None:
-                    img_height, img_width = img.shape[:2]
+                    # Get original dimensions
+                    orig_height, orig_width = img.shape[:2]
+                    img_height, img_width = orig_height, orig_width
+                    
+                    # Apply resize if enabled
+                    if resize_enabled and resize_factor < 1.0:
+                        img_width = int(orig_width * resize_factor)
+                        img_height = int(orig_height * resize_factor)
+                    
                     with open(txt_file, 'r') as f:
                         for line in f:
                             parts = line.strip().split()
                             if len(parts) == 5:
                                 class_id = int(parts[0])
-                                bbox = yolo_to_coco(parts[1:], img_width, img_height)
+                                bbox = yolo_to_coco(parts, img_width, img_height)
                                 ann = {'category_id': class_id, 'bbox': bbox}
                                 annotations_by_filename.setdefault(filename, []).append(ann)
                     if yolo_categories:
                         for cid in range(len(yolo_categories)):
                             categories[cid] = yolo_categories.get(cid, f"class_{cid}")
 
-    return annotations_by_filename, categories, agcontexts, info
+    elif annotation_type == "Binary":
+        # Set up "cracks" as the only category for binary masks
+        cat_id = 1  # Use 1 for the crack category ID
+        categories[cat_id] = "cracks"  # Define the category name
+        
+        # Create a cache directory if it doesn't exist
+        cache_dir = os.path.join(os.path.expanduser("~"), ".image_review_tool_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Generate a unique hash for this dataset combination
+        def generate_dataset_hash(ann_dir, img_dir):
+            # Get modification times to detect changes
+            ann_mtime = max([os.path.getmtime(os.path.join(ann_dir, f)) 
+                            for f in os.listdir(ann_dir) if os.path.isfile(os.path.join(ann_dir, f))], default=0)
+            
+            # Create hash from directories and modification time
+            hash_str = f"{os.path.abspath(ann_dir)}_{os.path.abspath(img_dir)}_{ann_mtime}"
+            return hashlib.md5(hash_str.encode('utf-8')).hexdigest()
+        
+        # Generate hash for current dataset
+        dataset_hash = generate_dataset_hash(annotation_dir, image_dir)
+        cache_file = os.path.join(cache_dir, f"binary_annotations_{dataset_hash}.json")
+        
+        # Check if we have cached data for this dataset
+        if os.path.exists(cache_file):
+            try:
+                print(f"Loading cached binary annotations from {cache_file}")
+                with open(cache_file, 'r') as f:
+                    cached_data = json.load(f)
+                    
+                # Restore data from cache
+                annotations_by_filename = cached_data.get('annotations_by_filename', {})
+                categories = cached_data.get('categories', {})
+                
+                # Convert category IDs back to integers (JSON stores them as strings)
+                categories = {int(k): v for k, v in categories.items()}
+                
+                # Return early with cached data
+                return annotations_by_filename, categories, agcontexts, info
+                
+            except Exception as e:
+                print(f"Error loading cache: {e}, will regenerate")
+        
+        # Define function to process a single mask file
+        def process_mask_file(mask_file, image_dir, cat_id, resize_enabled=False, resize_factor=1.0):
+            mask_basename = os.path.basename(mask_file)
+            mask_name_without_ext = os.path.splitext(mask_basename)[0]
+            
+            # Find the corresponding original image in the images directory
+            original_image_found = False
+            original_image_name = None
+            
+            # Get all files in the image directory and check them
+            try:
+                all_image_files = os.listdir(image_dir)
+                
+                # Check each file to find a matching name (case-insensitive)
+                for img_file in all_image_files:
+                    img_name_without_ext = os.path.splitext(img_file)[0]
+                    
+                    # Compare names ignoring case
+                    if img_name_without_ext.lower() == mask_name_without_ext.lower():
+                        original_image_found = True
+                        original_image_name = img_file  # Use the actual filename with correct case
+                        break
+            except Exception:
+                return []  # Problem with image directory
+            
+            if not original_image_found:
+                return []  # No matching image found
+            
+            # Load the binary mask - already binary, no thresholding needed
+            mask = cv2.imread(mask_file, cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                return []  # Failed to load mask
+            
+            # Apply resizing to mask if enabled
+            if resize_enabled and resize_factor < 1.0:
+                new_width = int(mask.shape[1] * resize_factor)
+                new_height = int(mask.shape[0] * resize_factor)
+                mask = cv2.resize(mask, (new_width, new_height), interpolation=cv2.INTER_NEAREST)
+                
+            # Ensure mask is binary
+            _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+            
+            # Find contours in the binary mask - use RETR_EXTERNAL to get only outer contours
+            # contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours, _ = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+            
+            # Alternative contour finding method to try if the above doesn't work:
+            # Use edge detection followed by contour finding
+            # edges = cv2.Canny(mask, 100, 200)
+            # contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            
+            # Skip if no contours found
+            if not contours:
+                return []
+            
+            # Process each contour
+            annotations = []
+            for contour in contours:
+                # Get bounding box of contour
+                x, y, w, h = cv2.boundingRect(contour)
+                
+                # Ensure minimum size for bounding box to avoid degenerate cases
+                w = max(1, w)
+                h = max(1, h)
+                
+                # Convert contour to COCO-style segmentation format
+                flattened = []
+                for point in contour:
+                    x_coord, y_coord = point[0]
+                    flattened.append(float(x_coord))
+                    flattened.append(float(y_coord))
+                
+                # Only proceed if we have at least 3 points (minimal polygon)
+                if len(flattened) >= 6:
+                    # Create the annotation
+                    ann = {
+                        'category_id': cat_id,
+                        'bbox': [x, y, w, h],
+                        'segmentation': [flattened],
+                        'area': cv2.contourArea(contour)
+                    }
+                    annotations.append((original_image_name, ann))
+            
+            return annotations
 
+        # Process binary masks and build annotations
+        print("Processing binary mask annotations (this may take a minute)...")
+        start_time = time.time()
+        
+        # Get all mask files
+        mask_files = glob.glob(os.path.join(annotation_dir, '*'))
+        
+        # Process all mask files in parallel using joblib with tqdm progress bar
+        n_jobs = -1  # Use all available cores
+        results = Parallel(n_jobs=n_jobs, prefer="processes")(  # prefer="processes" | "threads"
+            delayed(process_mask_file)(mask_file, image_dir, cat_id, resize_enabled=resize_enabled, 
+                resize_factor=resize_factor) 
+            for mask_file in tqdm(mask_files, desc="Processing binary masks")
+        )
+        
+        # Combine results from all parallel processes
+        for result in results:
+            for original_image_name, ann in result:
+                annotations_by_filename.setdefault(original_image_name, []).append(ann)
+        
+        # Save the processed data to cache file
+        try:
+            cache_data = {
+                'annotations_by_filename': annotations_by_filename,
+                'categories': categories,
+                # Only include metadata that's relevant
+            }
+            
+            with open(cache_file, 'w') as f:
+                json.dump(cache_data, f)
+                
+            processing_time = time.time() - start_time
+            print(f"Binary annotations processed and cached in {processing_time:.2f} seconds")
+            
+        except Exception as e:
+            print(f"Error saving to cache: {e}")
+            
+    return annotations_by_filename, categories, agcontexts, info
 
 def generate_category_colors(categories):
     colors = {}
@@ -116,7 +294,8 @@ def generate_category_colors(categories):
     num_categories = len(cat_ids)
     for i, cat_id in enumerate(cat_ids):
         hue = i / num_categories
-        r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+        # r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+        g, b, r = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
         colors[cat_id] = (int(b * 255), int(g * 255), int(r * 255))
     return colors
 
@@ -128,10 +307,11 @@ def draw_annotations(image, annotations, categories, category_colors, highlighte
         label = categories.get(cat_id, str(cat_id))
         if highlighted_index is not None and i == highlighted_index:
             draw_color = (0, 0, 255)
-            thickness = 4
+            thickness = 4  
         else:
             draw_color = base_color
-            thickness = 2
+            thickness = 2  
+        
         if 'segmentation' in ann and ann['segmentation']:
             segmentation = ann['segmentation']
             all_polygons = []
@@ -175,9 +355,7 @@ class FilteredViewTab:
         self.resize_after_id = None  # for debouncing
         self.loading_task_id = None  # for cancelling loading tasks
         self.is_loading = False  # flag to prevent multiple concurrent loads
-        self.max_thumbnails = 100  # limit thumbnails per page
-        self.current_page = 0  # current page of thumbnails
-        self.total_pages = 0  # total pages of thumbnails
+        self.max_thumbnails = 100  # limit thumbnails to prevent memory issues
         self.frame = ttk.Frame(self.parent)
         self.parent.add(self.frame, text="Filtered")
         self.create_tab()
@@ -193,18 +371,16 @@ class FilteredViewTab:
         self.class_combobox.pack(side=tk.LEFT, padx=5)
         self.class_combobox.bind("<<ComboboxSelected>>", self.update_filtered_images)
 
-        # Add sort control
-        sort_frame = ttk.Frame(control_frame)
-        sort_frame.pack(side=tk.RIGHT, padx=5)
+        # Add a loading indicator and limit control
+        limit_frame = ttk.Frame(control_frame)
+        limit_frame.pack(side=tk.RIGHT, padx=5)
 
-        ttk.Label(sort_frame, text="Sort by:", font=("Helvetica", 9)).pack(side=tk.LEFT)
-        self.sort_var = tk.StringVar(value="None")
-        sort_combobox = ttk.Combobox(sort_frame,
-                                     values=["None", "Size (Largest)", "Size (Smallest)",
-                                             "Color", "Green Channel", "Green Dominance", "Texture"],
-                                     textvariable=self.sort_var, width=20, state="readonly")
-        sort_combobox.pack(side=tk.LEFT, padx=5)
-        self.sort_var.trace("w", self.update_filtered_images)
+        ttk.Label(limit_frame, text="Max thumbnails:", font=("Helvetica", 9)).pack(side=tk.LEFT)
+        self.limit_var = tk.StringVar(value=str(self.max_thumbnails))
+        limit_entry = ttk.Spinbox(limit_frame, from_=10, to=500, width=5,
+                                  textvariable=self.limit_var, increment=10)
+        limit_entry.pack(side=tk.LEFT, padx=5)
+        self.limit_var.trace("w", self.update_thumbnail_limit)
 
         # Status/count indicator
         self.status_var = tk.StringVar(value="Ready")
@@ -234,49 +410,6 @@ class FilteredViewTab:
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Enhanced pagination controls (single set)
-        self.pagination_frame = ttk.Frame(self.frame)
-        self.pagination_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        # Left side: Previous button
-        self.prev_page_btn = ttk.Button(self.pagination_frame, text="← Previous",
-                                        command=self.previous_page, state=tk.DISABLED)
-        self.prev_page_btn.pack(side=tk.LEFT, padx=5)
-
-        # Center: Page input controls
-        page_input_frame = ttk.Frame(self.pagination_frame)
-        page_input_frame.pack(side=tk.LEFT, padx=10)
-
-        # Page text and input
-        ttk.Label(page_input_frame, text="Page:").pack(side=tk.LEFT, padx=2)
-        self.page_entry = ttk.Entry(page_input_frame, width=5)
-        self.page_entry.pack(side=tk.LEFT, padx=2)
-        self.page_entry.bind("<Return>", self.go_to_page)
-        ttk.Label(page_input_frame, text="of").pack(side=tk.LEFT, padx=2)
-        self.page_total_label = ttk.Label(page_input_frame, text="0")
-        self.page_total_label.pack(side=tk.LEFT, padx=2)
-
-        # Go button
-        ttk.Button(page_input_frame, text="Go", width=3,
-                   command=self.go_to_page).pack(side=tk.LEFT, padx=2)
-
-        # Right side: Max thumbnails and Next button
-        right_controls = ttk.Frame(self.pagination_frame)
-        right_controls.pack(side=tk.RIGHT)
-
-        # Max thumbnails control (moved to pagination area)
-        ttk.Label(right_controls, text="Max per page:").pack(side=tk.LEFT)
-        self.limit_var = tk.StringVar(value=str(self.max_thumbnails))
-        limit_entry = ttk.Spinbox(right_controls, from_=10, to=500, width=5,
-                                  textvariable=self.limit_var, increment=10)
-        limit_entry.pack(side=tk.LEFT, padx=5)
-        self.limit_var.trace("w", self.update_thumbnail_limit)
-
-        # Next button
-        self.next_page_btn = ttk.Button(right_controls, text="Next →",
-                                        command=self.next_page, state=tk.DISABLED)
-        self.next_page_btn.pack(side=tk.LEFT, padx=5)
-
         # Add progress bar
         self.progress = ttk.Progressbar(self.frame, orient=tk.HORIZONTAL, mode='determinate')
         self.progress.pack(fill=tk.X, padx=10, pady=5)
@@ -288,52 +421,6 @@ class FilteredViewTab:
         # Handle canvas resize
         self.canvas.bind("<Configure>", self.on_canvas_resize)
 
-    def go_to_page(self, event=None):
-        """Navigate to a specific page entered by the user"""
-        try:
-            # Get user input
-            page_num = int(self.page_entry.get())
-
-            # Validate page number
-            if 1 <= page_num <= self.total_pages:
-                self.current_page = page_num - 1  # Convert to 0-based index
-                self.update_page()
-            else:
-                messagebox.showinfo("Invalid Page",
-                                    f"Please enter a page number between 1 and {self.total_pages}")
-        except ValueError:
-            messagebox.showinfo("Invalid Input", "Please enter a valid page number")
-
-    def previous_page(self):
-        """Go to the previous page of thumbnails"""
-        if self.current_page > 0:
-            self.current_page -= 1
-            self.update_page()
-
-    def next_page(self):
-        """Go to the next page of thumbnails"""
-        if self.current_page < self.total_pages - 1:
-            self.current_page += 1
-            self.update_page()
-
-    def update_page(self):
-        """Update the current page of thumbnails"""
-        # Update page information
-        # self.page_info.config(text=f"Page {self.current_page + 1} of {self.total_pages}")  # This line causes the error
-
-        # Instead, update the page entry and total label
-        self.page_entry.delete(0, tk.END)
-        self.page_entry.insert(0, str(self.current_page + 1))
-        self.page_total_label.config(text=str(self.total_pages))
-
-        # Update button states
-        self.prev_page_btn.config(state=tk.NORMAL if self.current_page > 0 else tk.DISABLED)
-        self.next_page_btn.config(state=tk.NORMAL if self.current_page < self.total_pages - 1 else tk.DISABLED)
-
-        # Load thumbnails for current page
-        class_id = self.app.class_name_to_id.get(self.selected_class)
-        self.display_cropped_instances(class_id)
-
     def clear_thumbnail_cache(self):
         """Clear the thumbnail cache to force regeneration"""
         self.thumbnail_cache.clear()
@@ -341,58 +428,15 @@ class FilteredViewTab:
             self.update_filtered_images(None)
         messagebox.showinfo("Cache Cleared", "Thumbnail cache has been cleared.")
 
-    def manage_cache(self):
-        """Clean up thumbnail cache if it gets too large"""
-        cache_size = len(self.thumbnail_cache)
-        if cache_size > 500:  # arbitrary limit, adjust as needed
-            # Keep only the most recent items by creating a new cache
-            current_class_id = self.app.class_name_to_id.get(self.selected_class)
-            keys_to_keep = []
-
-            # Prioritize keeping thumbnails for current class
-            for key in self.thumbnail_cache.keys():
-                if key[1] == current_class_id:
-                    keys_to_keep.append(key)
-
-            # Keep the 300 most recent entries
-            if len(keys_to_keep) > 300:
-                keys_to_keep = keys_to_keep[-300:]
-
-            # Create new cache with only the keys we want to keep
-            new_cache = {}
-            for key in keys_to_keep:
-                new_cache[key] = self.thumbnail_cache[key]
-
-            self.thumbnail_cache = new_cache
-            print(f"Cache cleaned: {cache_size} → {len(self.thumbnail_cache)} items")
-
     def update_thumbnail_limit(self, *args):
-        """Update the maximum number of thumbnails to display per page"""
+        """Update the maximum number of thumbnails to display"""
         try:
             new_limit = int(self.limit_var.get())
             if 10 <= new_limit <= 500:
-                old_limit = self.max_thumbnails
                 self.max_thumbnails = new_limit
-
-                # Only recalculate if we've already filtered
-                if hasattr(self, 'filtered_annotations') and self.filtered_annotations:
-                    # Calculate current position to try to keep same items visible
-                    old_start_idx = self.current_page * old_limit
-
-                    # Calculate new total pages
-                    total_items = len(self.filtered_annotations)
-                    self.total_pages = max(1, (total_items + self.max_thumbnails - 1) // self.max_thumbnails)
-
-                    # Try to keep same starting item visible
-                    self.current_page = min(old_start_idx // new_limit, self.total_pages - 1)
-
-                    # Update the display
-                    self.update_page_controls(self.current_page, self.total_pages)
-
-                    # If already filtered, refresh the view
-                    if self.selected_class:
-                        class_id = self.app.class_name_to_id.get(self.selected_class)
-                        self.display_cropped_instances(class_id)
+                # If already filtered, refresh the view
+                if self.selected_class:
+                    self.update_filtered_images(None)
         except ValueError:
             pass  # Ignore invalid inputs
 
@@ -408,8 +452,8 @@ class FilteredViewTab:
             class_id = self.app.class_name_to_id.get(self.selected_class)
             self.display_cropped_instances(class_id)
 
-    def update_filtered_images(self, *args):
-        """Filter images by selected class and sort if requested"""
+    def update_filtered_images(self, event):
+        """Filter images by selected class"""
         # Cancel any ongoing loading
         if self.loading_task_id:
             self.canvas.after_cancel(self.loading_task_id)
@@ -424,149 +468,31 @@ class FilteredViewTab:
         self.selected_class = self.class_combobox.get()
         if not self.selected_class:
             self.status_var.set("No class selected")
-            self.update_page_controls(0, 0)
             return
 
-        # Get class ID
+        # Get class ID and filter images
         class_id = self.app.class_name_to_id.get(self.selected_class)
-
-        # Show progress for feature extraction if sorting by color or texture
-        sort_option = self.sort_var.get()
-        show_progress = sort_option != "None"
-
-        if show_progress:
-            progress_window = tk.Toplevel(self.app.root)
-            progress_window.title("Extracting Features")
-            progress_window.geometry("400x100")
-            progress_window.transient(self.app.root)
-            progress_window.grab_set()
-
-            ttk.Label(progress_window, text=f"Extracting features for {sort_option} sorting...",
-                      font=("Helvetica", 11)).pack(pady=10)
-
-            progress = ttk.Progressbar(progress_window, mode='determinate')
-            progress.pack(fill=tk.X, padx=20, pady=10)
-
-            # Count how many annotations we'll process
-            annotation_count = 0
-            for img_file in self.app.image_files:
-                anns = self.app.annotations_by_filename.get(img_file, [])
-                for ann in anns:
-                    if ann.get("category_id") == class_id:
-                        annotation_count += 1
-
-            progress['maximum'] = annotation_count
-            progress_count = 0
-            progress_window.update()
-
-        # Filter and calculate features
-        self.filtered_annotations = []
-
-        # Process all annotations for the selected class
-        for img_file in self.app.image_files:
-            anns = self.app.annotations_by_filename.get(img_file, [])
-
-            for ann_index, ann in enumerate(anns):
-                if ann.get("category_id") == class_id:
-                    # Create annotation item with basic info
-                    item = {
-                        'img_file': img_file,
-                        'ann_index': ann_index,
-                        'annotation': ann
-                    }
-
-                    # Extract features if needed for sorting
-                    if sort_option != "None":
-                        img_path = os.path.join(self.app.image_dir, img_file)
-                        features = self.extract_features_from_segmentation(img_path, ann)
-
-                        if features:
-                            item.update(features)
-
-                        # Update progress
-                        if show_progress:
-                            progress_count += 1
-                            if progress_count % 5 == 0:  # Update every 5 items
-                                progress['value'] = progress_count
-                                progress_window.update()
-
-                    self.filtered_annotations.append(item)
-
-        # Close progress window if open
-        if show_progress:
-            progress_window.destroy()
-
-        # Sort based on selected option
-        if sort_option == "Size (Largest)":
-            self.filtered_annotations.sort(key=lambda x: x.get('area', 0), reverse=True)
-        elif sort_option == "Size (Smallest)":
-            self.filtered_annotations.sort(key=lambda x: x.get('area', 0))
-        elif sort_option == "Color":
-            # Sort by overall color brightness (weighted RGB)
-            self.filtered_annotations.sort(
-                key=lambda x: 0.299 * x.get('mean_color', [0])[0] +
-                              0.587 * x.get('mean_color', [0, 0])[1] +
-                              0.114 * x.get('mean_color', [0, 0, 0])[2]
-                if 'mean_color' in x else 0,
-                reverse=True
-            )
-        elif sort_option == "Green Channel":
-            # Sort specifically by green channel value
-            self.filtered_annotations.sort(
-                key=lambda x: x.get('green_channel', 0) if 'green_channel' in x else 0,
-                reverse=True
-            )
-        elif sort_option == "Green Dominance":
-            # Sort by how dominant the green is compared to other channels
-            self.filtered_annotations.sort(
-                key=lambda x: x.get('green_dominance', 0) if 'green_dominance' in x else 0,
-                reverse=True
-            )
-        elif sort_option == "Texture":
-            # Sort by texture complexity
-            self.filtered_annotations.sort(
-                key=lambda x: x.get('texture_avg', 0) if 'texture_avg' in x else 0,
-                reverse=True
-            )
+        self.filtered_images = [img for img in self.app.image_files if any(
+            ann["category_id"] == class_id for ann in self.app.annotations_by_filename.get(img, [])
+        )]
 
         # Update status
-        if not self.filtered_annotations:
+        if not self.filtered_images:
             self.status_var.set(f"No images contain annotations for '{self.selected_class}'")
-            self.update_page_controls(0, 0)
             return
-
-        # Calculate total pages
-        total_items = len(self.filtered_annotations)
-        self.total_pages = max(1, (total_items + self.max_thumbnails - 1) // self.max_thumbnails)
-        self.current_page = 0
-
-        # Update page controls
-        self.update_page_controls(self.current_page, self.total_pages)
 
         # Set progress bar
         self.progress['value'] = 0
-        self.progress['maximum'] = min(self.max_thumbnails, total_items)
-
-        # Clean up cache periodically
-        self.manage_cache()
+        self.progress['maximum'] = min(len(self.filtered_images), self.max_thumbnails)
 
         # Start loading thumbnails
         self.is_loading = True
-        self.status_var.set(f"Loading page {self.current_page + 1} of {self.total_pages}...")
+        self.status_var.set(
+            f"Loading {min(len(self.filtered_images), self.max_thumbnails)} thumbnails of {len(self.filtered_images)} images...")
         self.display_cropped_instances(class_id)
 
-    def update_page_controls(self, current_page, total_pages):
-        """Update page controls with current state"""
-        self.page_total_label.config(text=str(total_pages))
-        self.page_entry.delete(0, tk.END)
-        self.page_entry.insert(0, str(current_page + 1))
-
-        # Update button states
-        self.prev_page_btn.config(state=tk.NORMAL if current_page > 0 else tk.DISABLED)
-        self.next_page_btn.config(state=tk.NORMAL if current_page < total_pages - 1 else tk.DISABLED)
-
     def display_cropped_instances(self, class_id):
-        """Display cropped instances with paged loading and sorting"""
+        """Display cropped instances with limited batch loading for performance"""
         if not self.is_loading:
             # Initial setup for loading
             for widget in self.scrollable_frame.winfo_children():
@@ -579,275 +505,148 @@ class FilteredViewTab:
         # Calculate grid layout
         max_columns = max(1, min(10, self.canvas.winfo_width() // 110))
 
-        # Begin loading with page offset
-        self.load_batch(class_id, 0, 0, max_columns, 0, 0)
+        # Begin or continue loading
+        self.load_batch(class_id, 0, 0, max_columns, 0)
 
-    def load_batch(self, class_id, row, col, max_columns, loaded_count, page_start):
-        """Load a batch of thumbnails with paging and sorting support"""
-        # Check if canvas is still visible
-        if not self.canvas.winfo_ismapped():
+    def load_batch(self, class_id, row, col, max_columns, loaded_count):
+        """Load a batch of thumbnails with controlled timing"""
+        # Limit total thumbnails
+        if loaded_count >= self.max_thumbnails or loaded_count >= len(self.filtered_images):
             self.is_loading = False
+            self.status_var.set(f"Showing {loaded_count} thumbnails from {len(self.filtered_images)} images")
+            self.progress['value'] = self.progress['maximum']
             return
 
-        # Calculate the range of items to display on this page
-        page_start_idx = self.current_page * self.max_thumbnails
-        page_end_idx = min(page_start_idx + self.max_thumbnails, len(self.filtered_annotations))
+        # Get the current image file
+        img_file = self.filtered_images[loaded_count]
+        img_path = os.path.join(self.app.image_dir, img_file)
 
-        # Get the items for this page
-        page_items = self.filtered_annotations[page_start_idx:page_end_idx]
+        try:
+            # Get annotations for this class in this image
+            matching_annotations = []
+            for ann_index, ann in enumerate(self.app.annotations_by_filename.get(img_file, [])):
+                if ann.get("category_id") == class_id:
+                    matching_annotations.append((ann_index, ann))
 
-        # Debug output
-        print(f"Attempting to load {len(page_items)} items on page {self.current_page + 1}")
-        if len(page_items) == 0:
-            print(f"No items found for this page. Total annotations: {len(self.filtered_annotations)}")
-            print(f"Page range: {page_start_idx} to {page_end_idx}")
+            if matching_annotations:
+                # Only load the image once for all annotations
+                image = cv2.imread(img_path)
+                if image is None:
+                    # Skip if image can't be loaded
+                    self.loading_task_id = self.canvas.after(10,
+                                                             lambda: self.load_batch(class_id, row, col, max_columns,
+                                                                                     loaded_count + 1))
+                    return
 
-        thumbnails_created = 0
+                # Process up to 5 annotations per image to avoid overloading
+                for ann_index, ann in matching_annotations[:5]:
+                    # Create a unique cache key including class_id to avoid mixed thumbnails
+                    cache_key = (img_file, class_id, ann_index)
 
-        # Process each annotation in this page
-        for item_idx, item in enumerate(page_items):
-            try:
-                img_file = item['img_file']
-                ann_index = item['ann_index']
-                ann = item['annotation']
+                    # Use cached thumbnail if available
+                    if cache_key in self.thumbnail_cache:
+                        tk_img = self.thumbnail_cache[cache_key]
+                    else:
+                        # Create thumbnail from the annotation bounding box
+                        if "bbox" in ann and len(ann["bbox"]) == 4:
+                            x, y, w, h = map(int, ann["bbox"])
 
-                print(f"Processing item {item_idx + 1}/{len(page_items)}: {img_file}, annotation {ann_index}")
+                            # Make sure the bbox coordinates are valid
+                            img_h, img_w = image.shape[:2]
+                            x = max(0, min(x, img_w - 1))
+                            y = max(0, min(y, img_h - 1))
+                            w = max(1, min(w, img_w - x))
+                            h = max(1, min(h, img_h - y))
 
-                # Create a unique cache key
-                cache_key = (img_file, class_id, ann_index)
+                            # Add small margin for visibility
+                            x_margin = max(0, x - 5)
+                            y_margin = max(0, y - 5)
+                            w_margin = min(w + 10, img_w - x_margin)
+                            h_margin = min(h + 10, img_h - y_margin)
 
-                # Use cached thumbnail if available
-                if cache_key in self.thumbnail_cache:
-                    print(f"Using cached thumbnail for {img_file}")
-                    tk_img = self.thumbnail_cache[cache_key]
-                else:
-                    # Load the image
-                    img_path = os.path.join(self.app.image_dir, img_file)
-                    print(f"Loading image from {img_path}")
-                    image = cv2.imread(img_path)
-                    if image is None:
-                        print(f"Failed to load image: {img_path}")
-                        continue
-
-                    print(f"Image loaded: {img_path}, shape: {image.shape}")
-
-                    # Check if annotation has bbox information
-                    if "bbox" not in ann or len(ann["bbox"]) != 4:
-                        print(f"No valid bbox in annotation: {ann}")
-                        # Try to use segmentation information if available
-                        if 'segmentation' in ann and ann['segmentation']:
-                            print(f"Found segmentation data, attempting to create bbox")
-                            # Try to create a bounding box from segmentation
+                            # Extract the cropped region
                             try:
-                                # Create a mask from segmentation
-                                img_h, img_w = image.shape[:2]
-                                mask = np.zeros((img_h, img_w), dtype=np.uint8)
+                                cropped = image[y_margin:y_margin + h_margin, x_margin:x_margin + w_margin].copy()
 
-                                for seg in ann['segmentation']:
-                                    if not isinstance(seg, list) or len(seg) < 6:
-                                        continue
-
-                                    points = np.array(seg, dtype=np.float32).reshape(-1, 2)
-                                    points = np.clip(points, 0, [img_w - 1, img_h - 1])
-                                    points = points.astype(np.int32)
-
-                                    # Draw polygon on mask
-                                    cv2.fillPoly(mask, [points], 255)
-
-                                # Find contours in the mask
-                                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                                if contours:
-                                    # Get bounding rectangle of the largest contour
-                                    largest_contour = max(contours, key=cv2.contourArea)
-                                    x, y, w, h = cv2.boundingRect(largest_contour)
-
-                                    # Create a temporary bbox
-                                    ann['bbox'] = [x, y, w, h]
-                                    print(f"Created bbox from segmentation: {ann['bbox']}")
-                                else:
-                                    print("No contours found in segmentation data")
+                                # Skip invalid crops
+                                if cropped.size == 0 or cropped is None:
                                     continue
-                            except Exception as seg_error:
-                                print(f"Error creating bbox from segmentation: {str(seg_error)}")
+
+                                # Draw a rectangle on the crop to highlight the actual annotation
+                                rect_x = x - x_margin
+                                rect_y = y - y_margin
+                                cv2.rectangle(cropped, (rect_x, rect_y),
+                                              (rect_x + w, rect_y + h), (0, 255, 0), 1)
+
+                                # Convert and resize
+                                cropped = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
+                                pil_img = Image.fromarray(cropped)
+
+                                # Calculate aspect ratio for better thumbnail
+                                aspect = w_margin / h_margin if h_margin > 0 else 1
+                                if aspect > 1.5:  # Wide image
+                                    thumb_w, thumb_h = 100, int(100 / aspect)
+                                elif aspect < 0.67:  # Tall image
+                                    thumb_w, thumb_h = int(100 * aspect), 100
+                                else:  # Roughly square
+                                    thumb_w, thumb_h = 100, 100
+
+                                # Resize the image
+                                try:
+                                    pil_img = pil_img.resize((thumb_w, thumb_h), Image.LANCZOS)
+                                except AttributeError:
+                                    # Fall back for older PIL versions
+                                    pil_img = pil_img.resize((thumb_w, thumb_h), Image.ANTIALIAS)
+
+                                # Create a new square image with white background (for consistent thumbnails)
+                                square_img = Image.new('RGB', (100, 100), (240, 240, 240))
+                                paste_x = (100 - thumb_w) // 2
+                                paste_y = (100 - thumb_h) // 2
+                                square_img.paste(pil_img, (paste_x, paste_y))
+
+                                # Convert to Tkinter PhotoImage
+                                tk_img = ImageTk.PhotoImage(square_img)
+                                self.thumbnail_cache[cache_key] = tk_img
+                            except Exception as e:
+                                print(f"Error creating thumbnail for {img_file}, annotation {ann_index}: {e}")
                                 continue
                         else:
-                            print("No bbox or segmentation data available")
-                            continue
+                            continue  # Skip annotations without bbox
 
-                    # Now we should have a bbox to work with
-                    x, y, w, h = map(int, ann["bbox"])
-                    print(f"Using bbox: x={x}, y={y}, w={w}, h={h}")
+                    # Create frame to hold thumbnail and label
+                    thumb_frame = ttk.Frame(self.scrollable_frame)
+                    thumb_frame.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
 
-                    # Make sure the bbox coordinates are valid
-                    img_h, img_w = image.shape[:2]
-                    x = max(0, min(x, img_w - 1))
-                    y = max(0, min(y, img_h - 1))
-                    w = max(1, min(w, img_w - x))
-                    h = max(1, min(h, img_h - y))
+                    # Create thumbnail button
+                    btn = ttk.Button(thumb_frame, image=tk_img,
+                                     command=lambda f=img_file, a=ann: self.navigate_to_instance(f, a))
+                    btn.pack(pady=(0, 2))
 
-                    # Add small margin for visibility
-                    x_margin = max(0, x - 5)
-                    y_margin = max(0, y - 5)
-                    w_margin = min(w + 10, img_w - x_margin)
-                    h_margin = min(h + 10, img_h - y_margin)
+                    # Add small label with filename
+                    ttk.Label(thumb_frame, text=img_file[:12] + "..." if len(img_file) > 15 else img_file,
+                              font=("Helvetica", 8)).pack()
 
-                    print(f"Cropping with margins: x={x_margin}, y={y_margin}, w={w_margin}, h={h_margin}")
+                    # Store reference to prevent garbage collection
+                    self.instance_images.append(tk_img)
 
-                    # Extract the cropped region
-                    try:
-                        cropped = image[y_margin:y_margin + h_margin, x_margin:x_margin + w_margin].copy()
-                        print(f"Cropped region shape: {cropped.shape}")
-                    except Exception as crop_error:
-                        print(f"Error cropping image {img_file}: {str(crop_error)}")
-                        continue
+                    # Update grid position
+                    col += 1
+                    if col >= max_columns:
+                        col = 0
+                        row += 1
+        except Exception as e:
+            # Log error but continue with other images
+            print(f"Error processing {img_file}: {str(e)}")
 
-                    # Skip invalid crops
-                    if cropped.size == 0 or cropped is None:
-                        print("Invalid crop: empty or None")
-                        continue
-
-                    try:
-                        # Draw a rectangle to highlight the annotation
-                        rect_x = x - x_margin
-                        rect_y = y - y_margin
-                        cv2.rectangle(cropped, (rect_x, rect_y),
-                                      (rect_x + w, rect_y + h), (0, 255, 0), 1)
-
-                        # Convert BGR to RGB for PIL
-                        cropped_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
-                        print("Successfully converted to RGB")
-
-                        # Convert to PIL Image
-                        pil_img = Image.fromarray(cropped_rgb)
-                        print(f"Created PIL image: {pil_img.size}")
-                    except Exception as e:
-                        print(f"Error processing thumbnail for {img_file}: {str(e)}")
-                        continue
-
-                    # Calculate aspect ratio for thumbnail
-                    try:
-                        aspect = w_margin / h_margin if h_margin > 0 else 1
-                        if aspect > 1.5:  # Wide image
-                            thumb_w, thumb_h = 100, int(100 / aspect)
-                        elif aspect < 0.67:  # Tall image
-                            thumb_w, thumb_h = int(100 * aspect), 100
-                        else:  # Roughly square
-                            thumb_w, thumb_h = 100, 100
-
-                        print(f"Calculated thumbnail size: {thumb_w}x{thumb_h}")
-
-                        # Resize the image
-                        try:
-                            pil_img = pil_img.resize((thumb_w, thumb_h), Image.Resampling.LANCZOS)
-                        except (AttributeError, NameError):
-                            # Fall back for older PIL versions
-                            try:
-                                pil_img = pil_img.resize((thumb_w, thumb_h), Image.LANCZOS)
-                            except AttributeError:
-                                pil_img = pil_img.resize((thumb_w, thumb_h), Image.ANTIALIAS)
-
-                        print(f"Resized PIL image to: {pil_img.size}")
-
-                        # Create a square background
-                        square_img = Image.new('RGB', (100, 100), (240, 240, 240))
-                        paste_x = (100 - thumb_w) // 2
-                        paste_y = (100 - thumb_h) // 2
-                        square_img.paste(pil_img, (paste_x, paste_y))
-                        print("Created square thumbnail with background")
-
-                        # Convert to Tkinter PhotoImage
-                        tk_img = ImageTk.PhotoImage(square_img)
-                        self.thumbnail_cache[cache_key] = tk_img
-                        print("Created Tkinter PhotoImage and cached it")
-                    except Exception as resize_error:
-                        print(f"Error resizing image {img_file}: {str(resize_error)}")
-                        continue
-
-                # Now create the UI component
-                print("Creating UI components for thumbnail")
-                thumb_frame = ttk.Frame(self.scrollable_frame)
-                thumb_frame.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
-
-                # Create thumbnail button
-                btn = ttk.Button(thumb_frame, image=tk_img,
-                                 command=lambda f=img_file, a=ann: self.navigate_to_instance(f, a))
-                btn.pack(pady=(0, 2))
-
-                # Create label frame
-                label_frame = ttk.Frame(thumb_frame)
-                label_frame.pack(fill=tk.X)
-
-                # Add filename label
-                truncated_name = img_file[:12] + "..." if len(img_file) > 15 else img_file
-                ttk.Label(label_frame, text=truncated_name,
-                          font=("Helvetica", 8)).pack(side=tk.LEFT)
-
-                # Add info based on sort type
-                sort_option = self.sort_var.get()
-                if sort_option in ["Size (Largest)", "Size (Smallest)"]:
-                    area = item.get('area', 0)
-                    info_label = ttk.Label(label_frame, text=f"{area:,}px",
-                                           font=("Helvetica", 7), foreground="#555555")
-                    info_label.pack(side=tk.RIGHT)
-                elif sort_option == "Color" and 'mean_color' in item:
-                    mean_color = item['mean_color']
-                    rgb_text = f"RGB:{int(mean_color[0])},{int(mean_color[1])},{int(mean_color[2])}"
-
-                    # Create color preview
-                    color_frame = ttk.Frame(label_frame, width=10, height=10)
-                    color_frame.pack(side=tk.RIGHT, padx=2)
-                    style_name = f"Color{thumbnails_created}.TFrame"
-                    color_frame.configure(style=style_name)
-
-                    # Set style with background color
-                    rgb_hex = "#{:02x}{:02x}{:02x}".format(
-                        int(mean_color[0]), int(mean_color[1]), int(mean_color[2]))
-                    self.app.root.tk.call('ttk::style', 'configure', style_name, 'background', rgb_hex)
-
-                    # Add RGB text
-                    info_label = ttk.Label(label_frame, text=rgb_text,
-                                           font=("Helvetica", 7), foreground="#555555")
-                    info_label.pack(side=tk.RIGHT)
-                # Handle other sort options...
-                # [code for other sort options would go here]
-
-                # Store reference to prevent garbage collection
-                self.instance_images.append(tk_img)
-                print(f"Successfully added thumbnail #{thumbnails_created + 1}")
-
-                # Update grid position
-                col += 1
-                if col >= max_columns:
-                    col = 0
-                    row += 1
-
-                # Update counters
-                thumbnails_created += 1
-
-            except Exception as e:
-                # Log error but continue with other images
-                print(
-                    f"Error processing item {item_idx} ({img_file if 'img_file' in locals() else 'unknown'}): {str(e)}")
-                import traceback
-                traceback.print_exc()
+        # Move to next image
+        loaded_count += 1
 
         # Update progress
-        self.progress['value'] = thumbnails_created
-        print(f"Created {thumbnails_created} thumbnails")
+        self.progress['value'] = loaded_count
 
-        # Update status
-        if thumbnails_created == 0 and self.total_pages > 0:
-            self.status_var.set(f"No thumbnails on this page. Try another page.")
-            print("No thumbnails were created for this page.")
-        else:
-            total_annotations = len(self.filtered_annotations)
-            start_idx = page_start_idx + 1
-            end_idx = page_start_idx + thumbnails_created
-            self.status_var.set(
-                f"Showing annotations {start_idx}-{end_idx} of {total_annotations} (page {self.current_page + 1} of {self.total_pages})")
-
-        # Finish loading
-        self.is_loading = False
+        # Schedule next batch with a slight delay to keep UI responsive
+        self.loading_task_id = self.canvas.after(10,
+                                                 lambda: self.load_batch(class_id, row, col, max_columns, loaded_count))
 
     def navigate_to_instance(self, img_file, annotation):
         """Navigate to the selected instance, explicitly saving comments first"""
@@ -868,274 +667,6 @@ class FilteredViewTab:
         else:
             self.status_var.set("No categories available")
 
-    def compute_similarity(self, features1, features2):
-        """Compute similarity score between two feature sets"""
-        if features1 is None or features2 is None:
-            return 0
-
-        # 1. Color similarity (using Euclidean distance of mean colors)
-        color_dist = np.linalg.norm(np.array(features1['mean_color']) - np.array(features2['mean_color']))
-        color_sim = 1.0 / (1.0 + color_dist)
-
-        # 2. Histogram similarity (using histogram intersection)
-        hist1 = np.array(features1['color_hist'])
-        hist2 = np.array(features2['color_hist'])
-        hist_sim = np.sum(np.minimum(hist1, hist2))
-
-        # 3. Texture similarity
-        texture_dist = np.linalg.norm(np.array(features1['texture']) - np.array(features2['texture']))
-        texture_sim = 1.0 / (1.0 + texture_dist)
-
-        # Combined similarity (weighted average)
-        similarity = 0.4 * color_sim + 0.4 * hist_sim + 0.2 * texture_sim
-
-        return similarity
-
-    def extract_features_from_segmentation(self, image_path, annotation):
-        """Extract features from the actual segmentation area rather than the bounding box"""
-        try:
-            # Load the image
-            image = cv2.imread(image_path)
-            if image is None:
-                print(f"Failed to load image: {image_path}")
-                return None
-
-            img_h, img_w = image.shape[:2]
-
-            # Create a mask from the segmentation
-            mask = np.zeros((img_h, img_w), dtype=np.uint8)
-            mask_created = False
-
-            # Try to create mask from segmentation
-            if 'segmentation' in annotation and annotation['segmentation']:
-                try:
-                    for seg in annotation['segmentation']:
-                        if not isinstance(seg, list) or len(seg) < 6:  # Need at least 3 points
-                            continue
-
-                        # Convert to numpy array of points
-                        points = np.array(seg, dtype=np.float32).reshape(-1, 2)
-
-                        # Check for valid coordinates
-                        if np.any(points < 0) or np.any(points[:, 0] >= img_w) or np.any(points[:, 1] >= img_h):
-                            # Clip points to image boundaries
-                            points[:, 0] = np.clip(points[:, 0], 0, img_w - 1)
-                            points[:, 1] = np.clip(points[:, 1], 0, img_h - 1)
-
-                        points = points.astype(np.int32)
-
-                        # Draw the polygon on the mask (positional args only)
-                        cv2.fillPoly(mask, [points], 255)
-                        mask_created = True
-                except Exception as seg_error:
-                    print(f"Error processing segmentation in {image_path}: {str(seg_error)}")
-                    # Continue to fallback
-
-            # Fallback to bbox if no segmentation was created
-            if not mask_created and 'bbox' in annotation:
-                try:
-                    x, y, w, h = map(int, annotation['bbox'])
-                    # Ensure coordinates are valid
-                    x = max(0, min(x, img_w - 1))
-                    y = max(0, min(y, img_h - 1))
-                    w = max(1, min(w, img_w - x))
-                    h = max(1, min(h, img_h - y))
-
-                    # Create rectangular mask (all positional args)
-                    cv2.rectangle(mask, (x, y), (x + w, y + h), 255, -1)  # -1 means filled
-                    mask_created = True
-                except Exception as bbox_error:
-                    print(f"Error creating bbox mask in {image_path}: {str(bbox_error)}")
-
-            if not mask_created:
-                print(f"Failed to create any mask for {image_path}")
-                return None
-
-            # Check if mask has any non-zero pixels
-            if cv2.countNonZero(mask) == 0:
-                print(f"Mask is empty for {image_path}")
-                return None
-
-            # Apply the mask to the image (positional args only)
-            masked_image = cv2.bitwise_and(image, image, mask)
-
-            # Convert to RGB for better color analysis
-            masked_rgb = cv2.cvtColor(masked_image, cv2.COLOR_BGR2RGB)
-
-            # Extract only the non-zero pixels for calculations
-            non_zero_mask = mask > 0
-            pixels = masked_rgb[non_zero_mask]
-
-            if len(pixels) == 0:
-                print(f"No pixels in masked region for {image_path}")
-                return None
-
-            # Calculate features
-            mean_color = np.mean(pixels, axis=0)
-            texture = np.std(pixels, axis=0)
-            texture_avg = np.mean(texture)
-            area = len(pixels)
-
-            # Extract specific channels
-            r_channel = pixels[:, 0].mean()
-            g_channel = pixels[:, 1].mean()
-            b_channel = pixels[:, 2].mean()
-
-            # Calculate green metrics
-            g_percent = g_channel / 255.0  # Normalized green value
-
-            # Calculate green dominance ratio
-            if (r_channel + b_channel) > 0:
-                green_dominance = g_channel / ((r_channel + b_channel) / 2)
-            else:
-                green_dominance = 1.0
-
-            return {
-                'mean_color': np.array([r_channel, g_channel, b_channel]),
-                'texture': texture,
-                'texture_avg': texture_avg,
-                'area': area,
-                'green_channel': g_channel,
-                'g_percent': g_percent,
-                'green_dominance': green_dominance
-            }
-
-        except Exception as e:
-            print(f"Error extracting features for {image_path}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return None
-
-    def extract_basic_features(self, image_path, bbox):
-        """Extract basic color and texture features from an annotation"""
-        try:
-            # Load the image
-            image = cv2.imread(image_path)
-            if image is None:
-                return None
-
-            # Extract the exact region of the annotation (no margin)
-            x, y, w, h = map(int, bbox)
-            img_h, img_w = image.shape[:2]
-
-            # Ensure coordinates are valid
-            x = max(0, min(x, img_w - 1))
-            y = max(0, min(y, img_h - 1))
-            w = max(1, min(w, img_w - x))
-            h = max(1, min(h, img_h - y))
-
-            # Extract the cutout - use exact annotation area
-            cutout = image[y:y + h, x:x + w]
-            if cutout.size == 0:
-                return None
-
-            # Convert to RGB
-            cutout_rgb = cv2.cvtColor(cutout, cv2.COLOR_BGR2RGB)
-
-            # Calculate mean color (RGB)
-            mean_color = cutout_rgb.mean(axis=(0, 1))
-
-            # Calculate texture (standard deviation of pixel values)
-            texture = cutout_rgb.std(axis=(0, 1))
-
-            # Calculate mean brightness (for sorting by brightness)
-            brightness = np.mean(mean_color)
-
-            # Calculate color variance (for vibrancy)
-            color_variance = np.var(mean_color)
-
-            return {
-                'mean_color': mean_color,
-                'texture': texture,
-                'brightness': brightness,
-                'color_variance': color_variance
-            }
-
-        except Exception as e:
-            print(f"Error extracting features: {e}")
-            return None
-
-    def compute_color_histogram(self, image, bins=8):
-        """Compute a color histogram with the specified number of bins per channel"""
-        hist = []
-        for i in range(3):  # RGB channels
-            channel_hist, _ = np.histogram(image[:, :, i], bins=bins, range=(0, 256))
-            # Normalize
-            channel_hist = channel_hist.astype(np.float32) / np.sum(channel_hist)
-            hist.extend(channel_hist)
-        return hist
-
-    def build_feature_database(self):
-        """Build a database of features for all class annotations"""
-        # Show a progress dialog
-        progress_window = tk.Toplevel(self.app.root)
-        progress_window.title("Building Feature Database")
-        progress_window.geometry("400x150")
-        progress_window.transient(self.app.root)
-        progress_window.grab_set()
-
-        ttk.Label(progress_window, text="Building feature database for similarity comparison...",
-                  font=("Helvetica", 11)).pack(pady=10)
-
-        progress = ttk.Progressbar(progress_window, mode='determinate')
-        progress.pack(fill=tk.X, padx=20, pady=10)
-
-        status_var = tk.StringVar(value="Initializing...")
-        status_label = ttk.Label(progress_window, textvariable=status_var)
-        status_label.pack(pady=5)
-
-        # Initialize database
-        self.feature_database = {}
-
-        # Count total annotations for progress
-        total_annotations = 0
-        for img_file in self.app.image_files:
-            total_annotations += len(self.app.annotations_by_filename.get(img_file, []))
-
-        progress['maximum'] = total_annotations
-        progress_window.update()
-
-        # Build the database
-        current_count = 0
-        for img_file in self.app.image_files:
-            img_path = os.path.join(self.app.image_dir, img_file)
-            annotations = self.app.annotations_by_filename.get(img_file, [])
-
-            for ann_index, ann in enumerate(annotations):
-                cat_id = ann.get("category_id")
-                class_name = self.app.categories.get(cat_id, str(cat_id))
-
-                if "bbox" in ann and len(ann["bbox"]) == 4:
-                    # Update progress and status
-                    current_count += 1
-                    if current_count % 10 == 0:  # Update UI periodically to avoid freezing
-                        progress['value'] = current_count
-                        status_var.set(f"Processing {img_file}: {current_count}/{total_annotations}")
-                        progress_window.update()
-
-                    # Extract features
-                    features = self.extract_features(img_path, ann["bbox"])
-
-                    if features:
-                        # Add to database
-                        if class_name not in self.feature_database:
-                            self.feature_database[class_name] = []
-
-                        self.feature_database[class_name].append({
-                            'img_file': img_file,
-                            'ann_index': ann_index,
-                            'features': features
-                        })
-
-        # Close progress window
-        progress['value'] = total_annotations
-        status_var.set("Feature database built successfully!")
-        progress_window.update()
-
-        # Add a delay so the user can see completion
-        progress_window.after(1000, progress_window.destroy)
-
-        return self.feature_database
 
 #########################
 # Side Panel (Notebook on Right)
@@ -1164,7 +695,23 @@ class SidePanel:
 
         # Set initial tab
         self.notebook.select(0)  # Start with the first tab
-
+    
+    def toggle_resize_factor(self):
+        if self.app.resize_enabled.get():  # If checkbox is checked
+            # Show the frame with the controls
+            self.resize_factor_label.pack(side=tk.LEFT, padx=5)
+            self.resize_factor_spinbox.pack(side=tk.LEFT, padx=5)
+            # Make sure the frame is visible in the grid
+            resize_factor_frame = self.resize_factor_label.master
+            resize_factor_frame.grid(row=8, column=0, columnspan=4, sticky=tk.W, padx=5, pady=0)
+        else:
+            # Hide the label and spinbox
+            self.resize_factor_label.pack_forget()
+            self.resize_factor_spinbox.pack_forget()
+            # Hide the entire frame
+            resize_factor_frame = self.resize_factor_label.master
+            resize_factor_frame.grid_remove()  # This removes the frame from the grid without destroying it
+            
     def create_load_data_tab(self):
         self.load_data_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.load_data_frame, text="Load Data")
@@ -1176,7 +723,7 @@ class SidePanel:
             container.grid_columnconfigure(i, weight=1)
 
         # Annotations directory row
-        ttk.Label(container, text="Annotations Directory:", font=("Helvetica", 11)).grid(
+        ttk.Label(container, text="Annotations\nDirectory:", font=("Helvetica", 11)).grid(
             row=0, column=0, sticky=tk.W, padx=5, pady=8)
         self.ann_dir_entry = ttk.Entry(container, width=35, font=("Helvetica", 11))
         self.ann_dir_entry.grid(row=0, column=1, columnspan=2, sticky=tk.EW, padx=5, pady=8)
@@ -1184,7 +731,7 @@ class SidePanel:
         browse_btn1.grid(row=0, column=3, padx=5, pady=8)
 
         # Images directory row
-        ttk.Label(container, text="Images Directory:", font=("Helvetica", 11)).grid(
+        ttk.Label(container, text="Images\nDirectory:", font=("Helvetica", 11)).grid(
             row=1, column=0, sticky=tk.W, padx=5, pady=8)
         self.img_dir_entry = ttk.Entry(container, width=35, font=("Helvetica", 11))
         self.img_dir_entry.grid(row=1, column=1, columnspan=2, sticky=tk.EW, padx=5, pady=8)
@@ -1192,7 +739,7 @@ class SidePanel:
         browse_btn2.grid(row=1, column=3, padx=5, pady=8)
 
         # Output Excel file row
-        ttk.Label(container, text="Output Excel File:", font=("Helvetica", 11)).grid(
+        ttk.Label(container, text="Output\nExcel File:", font=("Helvetica", 11)).grid(
             row=2, column=0, sticky=tk.W, padx=5, pady=8)
         self.output_entry = ttk.Entry(container, width=35, font=("Helvetica", 11))
         self.output_entry.grid(row=2, column=1, columnspan=2, sticky=tk.EW, padx=5, pady=8)
@@ -1208,7 +755,7 @@ class SidePanel:
         ttk.Radiobutton(container, text="VOC", variable=self.annotation_type, value="VOC",
                         command=self.toggle_yolo_labels).grid(row=3, column=2, sticky=tk.W, padx=5)
         ttk.Radiobutton(container, text="YOLO", variable=self.annotation_type, value="YOLO",
-                        command=self.toggle_yolo_labels).grid(row=3, column=3, sticky=tk.W, padx=5)
+                        command=self.toggle_yolo_labels).grid(row=4, column=1, sticky=tk.W, padx=5)
 
         # YOLO labels file row (hidden by default)
         self.yolo_labels_label = ttk.Label(container, text="YOLO Labels File:", font=("Helvetica", 11))
@@ -1216,9 +763,45 @@ class SidePanel:
         self.yolo_labels_button = ttk.Button(container, text="Browse", command=self.app.browse_yolo_labels)
         self.toggle_yolo_labels()  # Initial state
 
+        ttk.Radiobutton(container, text="Binary", variable=self.annotation_type, value="Binary",
+                        command=self.toggle_yolo_labels).grid(row=4, column=2, sticky=tk.W, padx=5)
+        
+        # Add resize image option
+        ttk.Separator(container, orient=tk.HORIZONTAL).grid(row=6, column=0, columnspan=4, sticky=tk.EW, pady=10)
+        
+        # Resize checkbox
+        # Resize checkbox (directly in container)
+        resize_cb = ttk.Checkbutton(container, text="Resize images on load", 
+                                variable=self.app.resize_enabled,
+                                onvalue=True, offvalue=False,
+                                command=self.toggle_resize_factor)
+        resize_cb.grid(row=7, column=0, columnspan=4, sticky=tk.W, padx=10, pady=5)
+        
+        # Resize factor entry and label in a new row (initially hidden)
+        resize_factor_frame = ttk.Frame(container)
+        resize_factor_frame.grid(row=8, column=0, columnspan=4, sticky=tk.W, padx=5, pady=0)
+        
+        self.resize_factor_label = ttk.Label(resize_factor_frame, text="Scale factor (0.1-1.0):", font=("Helvetica", 9))
+        self.resize_factor_spinbox = ttk.Spinbox(resize_factor_frame, from_=0.1, to=1.0, increment=0.1, 
+                                        width=5, textvariable=self.app.resize_factor)
+        
+        # Initialize visibility based on checkbox state
+        self.toggle_resize_factor()
+            
+        # Add Continue where you left option below annotation type
+        ttk.Separator(container, orient=tk.HORIZONTAL).grid(row=9, column=0, columnspan=4, sticky=tk.EW, pady=10)
+        
+        # Add the checkbox
+        self.app.continue_last = tk.BooleanVar(value=True)  # Default to checked
+        continue_cb = ttk.Checkbutton(container, text="Continue where you left", 
+                                variable=self.app.continue_last,
+                                onvalue=True, offvalue=False)
+        continue_cb.grid(row=10, column=0, columnspan=4, sticky=tk.W, padx=10, pady=5)
+        
         # Buttons row
+        ttk.Separator(container, orient=tk.HORIZONTAL).grid(row=11, column=0, columnspan=4, sticky=tk.EW, pady=10)
         btn_frame = ttk.Frame(container)
-        btn_frame.grid(row=5, column=0, columnspan=4, pady=15)
+        btn_frame.grid(row=12, column=0, columnspan=4, pady=15)
         btn_load = ttk.Button(btn_frame, text="Load Data", command=self.app.load_data, width=15)
         btn_load.pack(side=tk.LEFT, padx=5)
         btn_save = ttk.Button(btn_frame, text="Save Settings", command=self.app.save_settings, width=15)
@@ -1226,9 +809,9 @@ class SidePanel:
 
     def toggle_yolo_labels(self):
         if self.annotation_type.get() == "YOLO":
-            self.yolo_labels_label.grid(row=4, column=0, sticky=tk.W, padx=5, pady=8)
-            self.yolo_labels_entry.grid(row=4, column=1, columnspan=2, sticky=tk.EW, padx=5, pady=8)
-            self.yolo_labels_button.grid(row=4, column=3, padx=5, pady=8)
+            self.yolo_labels_label.grid(row=5, column=0, sticky=tk.W, padx=5, pady=8)
+            self.yolo_labels_entry.grid(row=5, column=1, columnspan=2, sticky=tk.EW, padx=5, pady=8)
+            self.yolo_labels_button.grid(row=5, column=3, padx=5, pady=8)
         else:
             self.yolo_labels_label.grid_remove()
             self.yolo_labels_entry.grid_remove()
@@ -1414,7 +997,11 @@ class ImageReviewApp:
         self.image_files = []
         self.current_index = 0
         self.comments = {}
-        self.annotations_on = tk.BooleanVar(value=True)
+        self.annotations_on = tk.BooleanVar(value=True)        
+        self.continue_last = tk.BooleanVar(value=True)  # Default to checked | "continue where you left" option
+        self.last_image_index = 0   # Variable to store the last viewed image index
+        self.resize_enabled = tk.BooleanVar(value=False)  # Default to not resizing
+        self.resize_factor = tk.DoubleVar(value=0.5)  # Default resize factor (50%)
         self.zoom_factor = 1.0
         self.pan_x = 0
         self.pan_y = 0
@@ -1424,7 +1011,7 @@ class ImageReviewApp:
         self._is_navigating = False
         self.canvas_width = 800
         self.canvas_height = 600
-        self.side_panel_visible = True
+        self.side_panel_visible = True  
         self.filter_var = None  # Will be initialized in create_annotation_panel
         self.counter_var = tk.StringVar(value="Image 0 of 0")  # For image counter
         self.ann_count_var = None  # Will be initialized in create_annotation_panel
@@ -1439,6 +1026,13 @@ class ImageReviewApp:
         self.agcontexts = {}  # Store WeedCOCO agricultural contexts
         self.info = {}  # Store WeedCOCO info
 
+        
+        self.selecting_region = False  # Flag to indicate if user is selecting a region
+        self.region_start_x = 0  # Canvas X coordinate of starting point
+        self.region_start_y = 0  # Canvas Y coordinate of starting point
+        self.region_rect_id = None  # Canvas ID for the rectangle being drawn
+        self.ctrl_pressed = False  # Flag to track if Ctrl key is pressed
+
         # Initialize UI component references that will be set by SidePanel
         self.stats_summary_label = None
         self.chart_frame = None
@@ -1451,6 +1045,7 @@ class ImageReviewApp:
 
         # create a temp file for comments to be saved across sessions
         self.temp_comments_file = os.path.join(tempfile.gettempdir(), "image_review_comments.json")
+        print(f"Temporary comments file: {self.temp_comments_file}")
         self.last_image_dir = None  # Track the last loaded image directory
         self.last_image_files_hash = None
 
@@ -1488,7 +1083,7 @@ class ImageReviewApp:
 
         # Create the persistent comments pane at the bottom
         self.persistent_comments_pane = ttk.Frame(self.main_vertical_paned)
-        self.main_vertical_paned.add(self.persistent_comments_pane, minsize=100, height=150)
+        self.main_vertical_paned.add(self.persistent_comments_pane, minsize=80, height=65)
 
         # Comments pane visibility flag
         self.comments_pane_visible = True
@@ -1526,7 +1121,23 @@ class ImageReviewApp:
         # Set up the close handler
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.root.bind("<Key>", self.on_key)
+        
+        # Maximize the window on startup
+        self.maximize_window()
 
+    def maximize_window(self):
+        """Maximize the application window"""
+        import platform
+        system = platform.system()
+        
+        if system == "Windows":
+            self.root.state('zoomed')
+        elif system == "Darwin":  # macOS
+            self.root.attributes('-fullscreen', False)
+            self.root.attributes('-zoomed', True)
+        else:  # Linux
+            self.root.attributes('-zoomed', True)
+        
     def toggle_side_panel(self):
         """Toggle the visibility of the right side panel"""
         if self.side_panel_visible:
@@ -1541,7 +1152,7 @@ class ImageReviewApp:
             self.main_paned.add(self.right_panel, minsize=250, width=300)
             self.side_panel_visible = True
             self.toggle_side_btn.config(text="Hide Side Panel ≫")
-
+        
     def create_annotation_panel(self, parent):
         """Create the left panel with annotation list"""
         # Main container with padding
@@ -1597,7 +1208,7 @@ class ImageReviewApp:
             foreground="#555555"
         )
         hint_label.pack(anchor=tk.W, pady=(5, 0))
-
+    
     def create_main_image_area(self, parent):
         """Create the center panel with the image canvas"""
         # Container for the image area with border
@@ -1624,14 +1235,29 @@ class ImageReviewApp:
         self.canvas = tk.Canvas(self.image_frame, bg="#f0f0f0", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
-        # Bind mouse events
-        self.canvas.bind("<ButtonPress-1>", self.on_mouse_press)
-        self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
+        # IMPORTANT: We completely separate the bindings for regular mode vs selection mode
+        # 1. Regular mode bindings - these will be disabled when Ctrl is pressed
+        self.canvas.bind("<ButtonPress-1>", self.start_pan, add="+")
+        self.canvas.bind("<B1-Motion>", self.do_pan, add="+")
+        
+        # 2. Selection mode bindings - these will be enabled only when Ctrl is pressed
+        # We bind them with empty callbacks initially, then we'll rebind them when needed
+        self.canvas.bind("<Control-ButtonPress-1>", self.start_region_select, add="+")
+        self.canvas.bind("<Control-B1-Motion>", self.update_region_select, add="+")
+        self.canvas.bind("<Control-ButtonRelease-1>", self.end_region_select, add="+")
+        
+        # 3. Always active bindings
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)  # Windows and macOS
         self.canvas.bind("<Button-4>", self.on_mouse_wheel)  # Linux scroll up
         self.canvas.bind("<Button-5>", self.on_mouse_wheel)  # Linux scroll down
         self.canvas.bind("<Configure>", self.on_canvas_configure)
         self.canvas.bind("<Motion>", self.on_mouse_move)
+        
+        # 4. Key bindings for Ctrl
+        self.root.bind("<KeyPress-Control_L>", self.ctrl_pressed_callback)
+        self.root.bind("<KeyPress-Control_R>", self.ctrl_pressed_callback)
+        self.root.bind("<KeyRelease-Control_L>", self.ctrl_released_callback)
+        self.root.bind("<KeyRelease-Control_R>", self.ctrl_released_callback)
 
         # Add a loading indicator/guidance text
         self.loading_text = self.canvas.create_text(
@@ -1642,6 +1268,173 @@ class ImageReviewApp:
             fill="#555555"
         )
 
+    def ctrl_pressed_callback(self, event):
+        """Handle Ctrl key press"""
+        self.ctrl_pressed = True
+        self.canvas.config(cursor="crosshair")
+        if hasattr(self, 'position_label'):
+            self.position_label.config(text="Hold Ctrl + drag to select region")
+
+    def ctrl_released_callback(self, event):
+        """Handle Ctrl key release"""
+        self.ctrl_pressed = False
+        self.canvas.config(cursor="")
+        if hasattr(self, 'position_label'):
+            self.position_label.config(text="")
+        # If we were in the middle of selecting, cancel it
+        if self.selecting_region and self.region_rect_id:
+            self.canvas.delete(self.region_rect_id)
+            self.selecting_region = False
+            self.region_rect_id = None
+
+    # These are completely separate methods for panning vs selection
+    def start_pan(self, event):
+        """Start panning the image"""
+        # Only if Ctrl is not pressed
+        if not self.ctrl_pressed:
+            self.drag_start_x = event.x
+            self.drag_start_y = event.y
+            self.orig_pan_x = self.pan_x
+            self.orig_pan_y = self.pan_y
+            self.canvas.config(cursor="fleur")
+
+    def do_pan(self, event):
+        """Pan the image as the mouse moves"""
+        # Only if Ctrl is not pressed
+        if not self.ctrl_pressed and self.base_cv_image is not None:
+            dx = event.x - self.drag_start_x
+            dy = event.y - self.drag_start_y
+            self.pan_x = self.orig_pan_x + dx
+            self.pan_y = self.orig_pan_y + dy
+            self.refresh_image()
+
+    def start_region_select(self, event):
+        """Start selecting a region (when Ctrl is pressed)"""
+        if self.base_cv_image is None:
+            return
+            
+        self.selecting_region = True
+        self.region_start_x = event.x
+        self.region_start_y = event.y
+        
+        # Create the selection rectangle
+        self.region_rect_id = self.canvas.create_rectangle(
+            event.x, event.y, event.x, event.y,
+            outline="red", width=2, dash=(4, 4)
+        )
+
+    def update_region_select(self, event):
+        """Update the region selection rectangle as the mouse moves"""
+        if not self.selecting_region or self.region_rect_id is None:
+            return
+            
+        # Update the rectangle coordinates
+        self.canvas.coords(self.region_rect_id, 
+                        self.region_start_x, self.region_start_y, 
+                        event.x, event.y)
+
+    def end_region_select(self, event):
+        """Finish selecting a region and process it"""
+        if not self.selecting_region or self.region_rect_id is None:
+            return
+            
+        # Get the coordinates of the selection rectangle
+        rect_coords = self.canvas.coords(self.region_rect_id)
+        if len(rect_coords) == 4:
+            # Convert canvas to image coordinates
+            x1 = int((rect_coords[0] - self.pan_x) / self.zoom_factor)
+            y1 = int((rect_coords[1] - self.pan_y) / self.zoom_factor)
+            x2 = int((rect_coords[2] - self.pan_x) / self.zoom_factor)
+            y2 = int((rect_coords[3] - self.pan_y) / self.zoom_factor)
+            
+            # Make sure coordinates are in top-left to bottom-right order
+            if x1 > x2:
+                x1, x2 = x2, x1
+            if y1 > y2:
+                y1, y2 = y2, y1
+                
+            # Check if the rectangle has a minimum size
+            min_size = 5
+            if (x2 - x1) >= min_size and (y2 - y1) >= min_size:
+                # Calculate width and height
+                width = x2 - x1
+                height = y2 - y1
+                
+                # Format the region info
+                region_info = f"Top left: ({x1},{y1}) and Bottom right: ({x2},{y2}) image coordinates and area is [{width}x{height}]"
+                
+                # Directly append to comment
+                self.append_to_comment(region_info)
+        
+        # Clean up
+        self.canvas.delete(self.region_rect_id)
+        self.selecting_region = False
+        self.region_rect_id = None
+    
+    def append_to_comment(self, region_info):
+        """Append region info to the current comment"""
+        if self.persistent_comment_text:
+            current_text = self.persistent_comment_text.get("1.0", tk.END).strip()
+            
+            # Create new text with region info
+            if current_text:
+                if current_text.endswith(".") or current_text.endswith("!") or current_text.endswith("?"):
+                    separator = " "
+                else:
+                    separator = ". "
+                new_text = current_text + separator + region_info
+            else:
+                new_text = region_info
+            
+            # Update the text widget
+            self.persistent_comment_text.delete("1.0", tk.END)
+            self.persistent_comment_text.insert("1.0", new_text)
+            
+            # Update char count and save
+            self.update_char_count()
+            self.save_comment(force_save=True)
+            
+            # Show a brief notification
+            self.position_label.config(text="Region coordinates added to comment")
+            self.root.after(2000, lambda: self.position_label.config(text=""))
+        
+        
+    def append_region_to_comment(self, comment_type, region_info):
+        """Append region info to the selected comment type"""
+        if self.persistent_comment_text:
+            current_text = self.persistent_comment_text.get("1.0", tk.END).strip()
+            
+            # Check if the comment type already exists in the text
+            if comment_type in current_text:
+                # Find the position to insert after the comment type
+                pos = current_text.find(comment_type) + len(comment_type)
+                
+                # Insert region info after the comment type
+                if current_text[pos:pos+1].isspace() or current_text[pos:pos+1] == ':':
+                    # There's already a space or colon, so just add the region info
+                    new_text = current_text[:pos] + f" {region_info}" + current_text[pos:]
+                else:
+                    # Add a space and the region info
+                    new_text = current_text[:pos] + f": {region_info}" + current_text[pos:]
+            else:
+                # Comment type doesn't exist, so add it with the region info
+                if current_text:
+                    if current_text.endswith(".") or current_text.endswith("!") or current_text.endswith("?"):
+                        separator = " "
+                    else:
+                        separator = ". "
+                    new_text = current_text + separator + f"{comment_type}: {region_info}"
+                else:
+                    new_text = f"{comment_type}: {region_info}"
+            
+            # Update the text widget
+            self.persistent_comment_text.delete("1.0", tk.END)
+            self.persistent_comment_text.insert("1.0", new_text)
+            
+            # Update char count and save
+            self.update_char_count()
+            self.save_comment(force_save=True)
+        
     def create_navigation_frame(self, parent):
         """Create the navigation controls below the image"""
         # Create a frame with visual separation
@@ -1708,9 +1501,16 @@ class ImageReviewApp:
 
             # Only show coordinates if cursor is inside the image
             if 0 <= img_x < w and 0 <= img_y < h:
-                self.position_label.config(text=f"Pos: ({img_x}, {img_y})")
+                if self.ctrl_pressed:
+                    # Show instruction while Ctrl is pressed
+                    self.position_label.config(text=f"Select region - Pos: ({img_x}, {img_y})")
+                else:
+                    self.position_label.config(text=f"Pos: ({img_x}, {img_y})")
             else:
-                self.position_label.config(text="")
+                if self.ctrl_pressed:
+                    self.position_label.config(text="Hold Ctrl + drag to select region")
+                else:
+                    self.position_label.config(text="")
 
     def on_mouse_press(self, event):
         """Start image dragging"""
@@ -1975,6 +1775,33 @@ class ImageReviewApp:
             self.highlighted_annotation_index = None
         self.refresh_image()
 
+    def add_predefined_comment(self, comment_text):
+        """Add a predefined comment to the text area"""
+        if self.persistent_comment_text:
+            # Get current text
+            current_text = self.persistent_comment_text.get("1.0", tk.END).strip()
+            
+            # If there's already text, add a space before the new comment
+            if current_text:
+                if current_text.endswith(".") or current_text.endswith("!") or current_text.endswith("?"):
+                    separator = " "
+                else:
+                    separator = ". "
+                new_text = current_text + separator + comment_text
+            else:
+                new_text = comment_text
+            
+            # Update the text widget
+            self.persistent_comment_text.delete("1.0", tk.END)
+            self.persistent_comment_text.insert("1.0", new_text)
+            
+            # Update char count and save
+            self.update_char_count()
+            self.save_comment(force_save=True)
+            
+            # Return "break" to prevent the default action of the key binding
+            return "break"
+            
     def create_persistent_comments(self, parent):
         """Create a persistent comments pane visible at all times"""
         # Container frame with title and controls
@@ -1983,23 +1810,28 @@ class ImageReviewApp:
 
         # Left side: title
         ttk.Label(comments_header, text="Comments for Current Image:",
-                  font=("Helvetica", 11, "bold")).pack(side=tk.LEFT)
+                font=("Helvetica", 11, "bold")).pack(side=tk.LEFT)
 
         # Right side: image name indicator
         self.current_image_var = tk.StringVar(value="No image loaded")
         ttk.Label(comments_header, textvariable=self.current_image_var,
-                  font=("Helvetica", 10, "italic")).pack(side=tk.RIGHT, padx=5)
+                font=("Helvetica", 10, "italic")).pack(side=tk.RIGHT, padx=5)
 
         # Text area with frame border
         text_frame = ttk.Frame(parent, borderwidth=1, relief="solid")
         text_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
 
         # Text widget for comments with scrollbar - CRITICAL: Name it correctly
-        self.persistent_comment_text = tk.Text(text_frame, height=5, font=("Helvetica", 11))
+        self.persistent_comment_text = tk.Text(text_frame, height=2, font=("Helvetica", 11))  # height=5
         self.persistent_comment_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2, pady=2)
         self.persistent_comment_text.bind("<FocusOut>", lambda e: self.save_comment(force_save=True))
         # For backward compatibility - this ensures both references point to the same widget
         self.comment_text = self.persistent_comment_text
+
+        # Add keyboard shortcuts for predefined comments
+        self.persistent_comment_text.bind("<Control-f>", lambda e: self.add_predefined_comment("Full revision"))
+        self.persistent_comment_text.bind("<Control-n>", lambda e: self.add_predefined_comment("Minor edits"))
+        self.persistent_comment_text.bind("<Control-m>", lambda e: self.add_predefined_comment("Major edits"))
 
         # Add a vertical scrollbar
         scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.persistent_comment_text.yview)
@@ -2009,7 +1841,7 @@ class ImageReviewApp:
         # Add a character counter
         self.char_count_var = tk.StringVar(value="0 characters")
         char_count = ttk.Label(parent, textvariable=self.char_count_var,
-                               font=("Helvetica", 8), foreground="#555555")
+                            font=("Helvetica", 8), foreground="#555555")
         char_count.pack(side=tk.RIGHT, padx=10, pady=(0, 5))
 
         # Add a "Save" button for explicit saving
@@ -2020,6 +1852,21 @@ class ImageReviewApp:
         clear_btn = ttk.Button(parent, text="Clear", command=self.clear_comment)
         clear_btn.pack(side=tk.LEFT, padx=10, pady=(0, 5))
 
+        # Create a frame for shortcut buttons
+        shortcuts_frame = ttk.Frame(parent)
+        shortcuts_frame.pack(side=tk.LEFT, padx=10, pady=(0, 5))
+        
+        # Add shortcut buttons
+        ttk.Button(shortcuts_frame, text="Full (Ctrl+F)", 
+                command=lambda: self.add_predefined_comment("Full revision"), 
+                width=12).pack(side=tk.LEFT, padx=2)
+        ttk.Button(shortcuts_frame, text="Minor (Ctrl+N)", 
+                command=lambda: self.add_predefined_comment("Minor edits"), 
+                width=12).pack(side=tk.LEFT, padx=2)
+        ttk.Button(shortcuts_frame, text="Major (Ctrl+M)", 
+                command=lambda: self.add_predefined_comment("Major edits"), 
+                width=12).pack(side=tk.LEFT, padx=2)
+
         # Bind text change to update character count
         self.persistent_comment_text.bind("<<Modified>>", self.update_char_count)
 
@@ -2028,7 +1875,7 @@ class ImageReviewApp:
 
         # Handle Tab key properly
         self.persistent_comment_text.bind("<Tab>", self.handle_tab_key)
-
+    
     def clear_comment(self):
         """Clear the comment in the editable area and remove it from storage"""
         if self.persistent_comment_text:
@@ -2083,7 +1930,7 @@ class ImageReviewApp:
         except Exception as e:
             print(f"Failed to load comments from temp file: {e}")
             self.comments = {}
-
+    
     def load_new_image(self, save_current=True):
         if not self.image_files:
             return
@@ -2108,14 +1955,30 @@ class ImageReviewApp:
             current_file = self.image_files[self.current_index]
             image_path = os.path.join(self.image_dir, current_file)
 
+            # Load the image
             self.base_cv_image = cv2.imread(image_path)
             if self.base_cv_image is None:
                 messagebox.showerror("Error", f"Failed to load image: {current_file}")
                 return
 
+            # Apply resizing if enabled
+            original_size = None
+            if self.resize_enabled.get() and self.resize_factor.get() < 1.0:
+                original_size = (self.base_cv_image.shape[1], self.base_cv_image.shape[0])  # Store original width, height
+                scale_factor = self.resize_factor.get()
+                new_width = int(self.base_cv_image.shape[1] * scale_factor)
+                new_height = int(self.base_cv_image.shape[0] * scale_factor)
+                self.base_cv_image = cv2.resize(self.base_cv_image, (new_width, new_height), 
+                                            interpolation=cv2.INTER_AREA)
+
             # Update image information
             h, w = self.base_cv_image.shape[:2]
-            self.image_info.config(text=f"Image: {current_file} ({w}×{h})")
+            if original_size:
+                # Show both original and resized dimensions
+                orig_w, orig_h = original_size
+                self.image_info.config(text=f"Image: {current_file} ({w}×{h}, original: {orig_w}×{orig_h})")
+            else:
+                self.image_info.config(text=f"Image: {current_file} ({w}×{h})")
 
             self.highlighted_annotation_index = None
             orig_h, orig_w = self.base_cv_image.shape[:2]
@@ -2252,9 +2115,9 @@ class ImageReviewApp:
 
         # Make a copy of the original image
         img = self.base_cv_image.copy()
-        current_file = self.image_files[self.current_index]
+        current_file = self.image_files[self.current_index]        
 
-        # Draw annotations if enabled
+        # Draw annotations if enabled        
         if self.annotations_on.get() and current_file in self.annotations_by_filename:
             ann_list = self.annotations_by_filename[current_file]
             img = draw_annotations(img, ann_list, self.categories, self.category_colors,
@@ -2333,7 +2196,18 @@ class ImageReviewApp:
             # Let the Text widget handle the key normally
             return
 
-        # Otherwise, handle navigation shortcuts
+        # These shortcuts will work even when not focused on the text area
+        if event.keysym == "f" and event.state & 0x4:  # Ctrl+F
+            self.add_predefined_comment("Full revision")
+            return "break"
+        elif event.keysym == "n" and event.state & 0x4:  # Ctrl+N
+            self.add_predefined_comment("Minor edits")
+            return "break"
+        elif event.keysym == "m" and event.state & 0x4:  # Ctrl+M
+            self.add_predefined_comment("Major edits")
+            return "break"
+        
+        # Navigation shortcuts
         if event.keysym == "Left":
             self.prev_image()
         elif event.keysym == "Right":
@@ -2347,7 +2221,7 @@ class ImageReviewApp:
             self.zoom_out()
         elif event.keysym == "r":
             self.reset_view()
-
+                
     def export_reviews(self):
         """Export comments to Excel with improved information"""
         self.save_comment()  # Save the current comment before exporting
@@ -2491,6 +2365,10 @@ class ImageReviewApp:
                 self.annotation_dir = settings.get("annotation_dir", "")
                 self.image_dir = settings.get("image_dir", "")
                 self.output_excel = settings.get("output_excel", "")
+                
+                # Load the last image index
+                self.last_image_index = settings.get("last_image_index", 0)
+                
                 try:
                     self.side_panel.ann_dir_entry.delete(0, tk.END)
                     self.side_panel.ann_dir_entry.insert(0, self.annotation_dir)
@@ -2502,6 +2380,9 @@ class ImageReviewApp:
                     pass
             except Exception as e:
                 messagebox.showwarning("Settings Load Error", f"Could not load settings: {e}")
+                self.last_image_index = 0
+        else:
+            self.last_image_index = 0
 
     def save_settings(self):
         try:
@@ -2513,7 +2394,8 @@ class ImageReviewApp:
         settings = {
             "annotation_dir": self.annotation_dir,
             "image_dir": self.image_dir,
-            "output_excel": self.output_excel
+            "output_excel": self.output_excel,
+            "last_image_index": self.current_index,  # Save the current image index
         }
         settings_file = get_settings_file()
         try:
@@ -2565,6 +2447,7 @@ class ImageReviewApp:
         self.output_excel = self.side_panel.output_entry.get().strip()
         annotation_type = self.side_panel.annotation_type.get()
         self.yolo_labels_file = self.side_panel.yolo_labels_entry.get().strip() if annotation_type == "YOLO" else ""
+        
         if not os.path.isdir(self.annotation_dir):
             messagebox.showerror("Error", "Invalid annotations directory.")
             return
@@ -2574,21 +2457,36 @@ class ImageReviewApp:
         if not self.output_excel.endswith(".xlsx"):
             messagebox.showerror("Error", "Output file must have a .xlsx extension.")
             return
+        
         self.annotations_by_filename, self.categories, self.agcontexts, self.info = load_annotations(
-            self.annotation_dir, annotation_type, self.image_dir, self.yolo_labels_file)
+            self.annotation_dir, annotation_type, self.image_dir, self.yolo_labels_file, resize_enabled=self.resize_enabled.get(),
+            resize_factor=self.resize_factor.get())
         self.category_colors = generate_category_colors(self.categories)
         self.side_panel.filtered_tab.populate_class_list(self.categories)
         self.class_name_to_id = {cat_name: cat_id for cat_id, cat_name in self.categories.items()}
+        
         if self.categories:
             self.heatmap_class_combobox['values'] = list(self.categories.values())
             if self.categories:
                 self.heatmap_class_combobox.current(0)
         valid_exts = ('.png', '.jpg', '.jpeg', '.bmp')
         self.image_files = sorted([f for f in os.listdir(self.image_dir) if f.lower().endswith(valid_exts)])
+        
         if not self.image_files:
             messagebox.showerror("Error", "No images found in the image directory.")
             return
-        self.current_index = 0
+        
+        # Check if we should continue from where the user left off
+        if hasattr(self, 'continue_last') and self.continue_last.get() and hasattr(self, 'last_image_index'):
+            # Make sure the index is valid for the current dataset
+            if 0 <= self.last_image_index < len(self.image_files):
+                self.current_index = self.last_image_index
+                print(f"Continuing from image {self.current_index + 1} of {len(self.image_files)}")
+            else:
+                self.current_index = 0
+        else:
+            self.current_index = 0
+            
         if os.path.exists(self.temp_comments_file):
             try:
                 with open(self.temp_comments_file, 'r') as f:
