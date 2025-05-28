@@ -1199,30 +1199,53 @@ class SidePanel:
         browse_btn3 = ttk.Button(container, text="Browse", command=self.app.browse_output_file)
         browse_btn3.grid(row=2, column=3, padx=5, pady=8)
 
-        # Annotation type selection
-        ttk.Label(container, text="Annotation Type:", font=("Helvetica", 11)).grid(
+        # NEW: Previous Comments Excel file row
+        ttk.Label(container, text="Previous Comments File:", font=("Helvetica", 11)).grid(
             row=3, column=0, sticky=tk.W, padx=5, pady=8)
+        self.previous_comments_entry = ttk.Entry(container, width=35, font=("Helvetica", 11))
+        self.previous_comments_entry.grid(row=3, column=1, columnspan=2, sticky=tk.EW, padx=5, pady=8)
+        browse_btn4 = ttk.Button(container, text="Browse", command=self.app.browse_previous_comments_file)
+        browse_btn4.grid(row=3, column=3, padx=5, pady=8)
+
+        # Add a small help text for previous comments
+        help_label = ttk.Label(container, text="(Optional: Load previous comments from Excel file)",
+                               font=("Helvetica", 9), foreground="#666666")
+        help_label.grid(row=3, column=4, sticky=tk.W, padx=5)
+
+        # Annotation type selection (moved to row 4)
+        ttk.Label(container, text="Annotation Type:", font=("Helvetica", 11)).grid(
+            row=4, column=0, sticky=tk.W, padx=5, pady=8)
         self.annotation_type = tk.StringVar(value="COCO")
         ttk.Radiobutton(container, text="COCO", variable=self.annotation_type, value="COCO",
-                        command=self.toggle_yolo_labels).grid(row=3, column=1, sticky=tk.W, padx=5)
+                        command=self.toggle_yolo_labels).grid(row=4, column=1, sticky=tk.W, padx=5)
         ttk.Radiobutton(container, text="VOC", variable=self.annotation_type, value="VOC",
-                        command=self.toggle_yolo_labels).grid(row=3, column=2, sticky=tk.W, padx=5)
+                        command=self.toggle_yolo_labels).grid(row=4, column=2, sticky=tk.W, padx=5)
         ttk.Radiobutton(container, text="YOLO", variable=self.annotation_type, value="YOLO",
-                        command=self.toggle_yolo_labels).grid(row=3, column=3, sticky=tk.W, padx=5)
+                        command=self.toggle_yolo_labels).grid(row=4, column=3, sticky=tk.W, padx=5)
 
-        # YOLO labels file row (hidden by default)
+        # YOLO labels file row (hidden by default) - moved to row 5
         self.yolo_labels_label = ttk.Label(container, text="YOLO Labels File:", font=("Helvetica", 11))
         self.yolo_labels_entry = ttk.Entry(container, width=35, font=("Helvetica", 11))
         self.yolo_labels_button = ttk.Button(container, text="Browse", command=self.app.browse_yolo_labels)
         self.toggle_yolo_labels()  # Initial state
 
-        # Buttons row
+        # Buttons row (moved to row 6)
         btn_frame = ttk.Frame(container)
-        btn_frame.grid(row=5, column=0, columnspan=4, pady=15)
+        btn_frame.grid(row=6, column=0, columnspan=4, pady=15)
         btn_load = ttk.Button(btn_frame, text="Load Data", command=self.app.load_data, width=15)
         btn_load.pack(side=tk.LEFT, padx=5)
         btn_save = ttk.Button(btn_frame, text="Save Settings", command=self.app.save_settings, width=15)
         btn_save.pack(side=tk.LEFT, padx=5)
+
+    def toggle_yolo_labels(self):
+        if self.annotation_type.get() == "YOLO":
+            self.yolo_labels_label.grid(row=5, column=0, sticky=tk.W, padx=5, pady=8)
+            self.yolo_labels_entry.grid(row=5, column=1, columnspan=2, sticky=tk.EW, padx=5, pady=8)
+            self.yolo_labels_button.grid(row=5, column=3, padx=5, pady=8)
+        else:
+            self.yolo_labels_label.grid_remove()
+            self.yolo_labels_entry.grid_remove()
+            self.yolo_labels_button.grid_remove()
 
     def toggle_yolo_labels(self):
         if self.annotation_type.get() == "YOLO":
@@ -1438,6 +1461,7 @@ class ImageReviewApp:
         self.yolo_labels_file = ""
         self.agcontexts = {}  # Store WeedCOCO agricultural contexts
         self.info = {}  # Store WeedCOCO info
+        self.previous_comments_file = ""
 
         # Initialize UI component references that will be set by SidePanel
         self.stats_summary_label = None
@@ -1695,6 +1719,82 @@ class ImageReviewApp:
 
         # Add reset view button
         ttk.Button(nav_right, text="Reset View", command=self.reset_view).pack(side=tk.RIGHT, padx=5)
+
+    def browse_previous_comments_file(self):
+        """Browse for previous comments Excel file"""
+        file_path = filedialog.askopenfilename(
+            title="Select Previous Comments File",
+            filetypes=[("Excel Files", "*.xlsx"), ("All Files", "*.*")]
+        )
+        if file_path:
+            try:
+                self.side_panel.previous_comments_entry.delete(0, tk.END)
+                self.side_panel.previous_comments_entry.insert(0, file_path)
+            except Exception:
+                pass
+            self.previous_comments_file = file_path
+
+    def load_previous_comments(self, file_path):
+        """Load previous comments from Excel file"""
+        if not file_path or not os.path.exists(file_path):
+            return {}
+
+        try:
+            # Read the Excel file
+            df = pd.read_excel(file_path)
+
+            # Look for common column name variations
+            image_col = None
+            comment_col = None
+
+            # Check for image column
+            for col in df.columns:
+                col_lower = col.lower().strip()
+                if col_lower in ['image_name', 'image', 'filename', 'file_name', 'image_file']:
+                    image_col = col
+                    break
+
+            # Check for comment column
+            for col in df.columns:
+                col_lower = col.lower().strip()
+                if col_lower in ['comment', 'comments', 'review', 'notes', 'description']:
+                    comment_col = col
+                    break
+
+            if image_col is None or comment_col is None:
+                messagebox.showwarning(
+                    "Column Not Found",
+                    f"Could not find image and comment columns.\n"
+                    f"Available columns: {', '.join(df.columns)}\n"
+                    f"Looking for: image_name/image/filename and comment/comments/review"
+                )
+                return {}
+
+            # Load the comments
+            previous_comments = {}
+            loaded_count = 0
+
+            for _, row in df.iterrows():
+                image_name = str(row[image_col]).strip()
+                comment = str(row[comment_col]).strip() if pd.notna(row[comment_col]) else ""
+
+                if image_name and comment and comment.lower() not in ['nan', 'none', '']:
+                    previous_comments[image_name] = comment
+                    loaded_count += 1
+
+            messagebox.showinfo(
+                "Previous Comments Loaded",
+                f"Successfully loaded {loaded_count} previous comments from:\n{os.path.basename(file_path)}"
+            )
+
+            return previous_comments
+
+        except Exception as e:
+            messagebox.showerror(
+                "Error Loading Comments",
+                f"Failed to load previous comments from {os.path.basename(file_path)}:\n{str(e)}"
+            )
+            return {}
 
     def on_mouse_move(self, event):
         """Update status bar with cursor position"""
@@ -2482,6 +2582,30 @@ class ImageReviewApp:
         toolbar.update()
         self.heatmap_chart_canvas._tkcanvas.pack(fill=tk.BOTH, expand=True)
 
+    def save_settings(self):
+        try:
+            self.annotation_dir = self.side_panel.ann_dir_entry.get().strip()
+            self.image_dir = self.side_panel.img_dir_entry.get().strip()
+            self.output_excel = self.side_panel.output_entry.get().strip()
+            self.previous_comments_file = self.side_panel.previous_comments_entry.get().strip()
+        except Exception:
+            pass
+
+        settings = {
+            "annotation_dir": self.annotation_dir,
+            "image_dir": self.image_dir,
+            "output_excel": self.output_excel,
+            "previous_comments_file": getattr(self, 'previous_comments_file', '')
+        }
+
+        settings_file = get_settings_file()
+        try:
+            with open(settings_file, "w") as f:
+                json.dump(settings, f)
+            messagebox.showinfo("Settings Saved", "Settings have been saved successfully.")
+        except Exception as e:
+            messagebox.showerror("Settings Save Error", f"Could not save settings: {e}")
+
     def load_settings(self):
         settings_file = get_settings_file()
         if os.path.exists(settings_file):
@@ -2491,6 +2615,8 @@ class ImageReviewApp:
                 self.annotation_dir = settings.get("annotation_dir", "")
                 self.image_dir = settings.get("image_dir", "")
                 self.output_excel = settings.get("output_excel", "")
+                self.previous_comments_file = settings.get("previous_comments_file", "")
+
                 try:
                     self.side_panel.ann_dir_entry.delete(0, tk.END)
                     self.side_panel.ann_dir_entry.insert(0, self.annotation_dir)
@@ -2498,30 +2624,12 @@ class ImageReviewApp:
                     self.side_panel.img_dir_entry.insert(0, self.image_dir)
                     self.side_panel.output_entry.delete(0, tk.END)
                     self.side_panel.output_entry.insert(0, self.output_excel)
+                    self.side_panel.previous_comments_entry.delete(0, tk.END)
+                    self.side_panel.previous_comments_entry.insert(0, self.previous_comments_file)
                 except Exception:
                     pass
             except Exception as e:
                 messagebox.showwarning("Settings Load Error", f"Could not load settings: {e}")
-
-    def save_settings(self):
-        try:
-            self.annotation_dir = self.side_panel.ann_dir_entry.get().strip()
-            self.image_dir = self.side_panel.img_dir_entry.get().strip()
-            self.output_excel = self.side_panel.output_entry.get().strip()
-        except Exception:
-            pass
-        settings = {
-            "annotation_dir": self.annotation_dir,
-            "image_dir": self.image_dir,
-            "output_excel": self.output_excel
-        }
-        settings_file = get_settings_file()
-        try:
-            with open(settings_file, "w") as f:
-                json.dump(settings, f)
-            messagebox.showinfo("Settings Saved", "Settings have been saved successfully.")
-        except Exception as e:
-            messagebox.showerror("Settings Save Error", f"Could not save settings: {e}")
 
     def on_closing(self):
         self.save_settings()
@@ -2560,11 +2668,14 @@ class ImageReviewApp:
             self.output_excel = file_path
 
     def load_data(self):
+        """Enhanced load_data method with previous comments support"""
         self.annotation_dir = self.side_panel.ann_dir_entry.get().strip()
         self.image_dir = self.side_panel.img_dir_entry.get().strip()
         self.output_excel = self.side_panel.output_entry.get().strip()
+        previous_comments_file = self.side_panel.previous_comments_entry.get().strip()
         annotation_type = self.side_panel.annotation_type.get()
         self.yolo_labels_file = self.side_panel.yolo_labels_entry.get().strip() if annotation_type == "YOLO" else ""
+
         if not os.path.isdir(self.annotation_dir):
             messagebox.showerror("Error", "Invalid annotations directory.")
             return
@@ -2574,21 +2685,35 @@ class ImageReviewApp:
         if not self.output_excel.endswith(".xlsx"):
             messagebox.showerror("Error", "Output file must have a .xlsx extension.")
             return
+
+        # Load annotations as before
         self.annotations_by_filename, self.categories, self.agcontexts, self.info = load_annotations(
             self.annotation_dir, annotation_type, self.image_dir, self.yolo_labels_file)
         self.category_colors = generate_category_colors(self.categories)
         self.side_panel.filtered_tab.populate_class_list(self.categories)
         self.class_name_to_id = {cat_name: cat_id for cat_id, cat_name in self.categories.items()}
+
         if self.categories:
             self.heatmap_class_combobox['values'] = list(self.categories.values())
             if self.categories:
                 self.heatmap_class_combobox.current(0)
+
         valid_exts = ('.png', '.jpg', '.jpeg', '.bmp')
         self.image_files = sorted([f for f in os.listdir(self.image_dir) if f.lower().endswith(valid_exts)])
+
         if not self.image_files:
             messagebox.showerror("Error", "No images found in the image directory.")
             return
+
         self.current_index = 0
+
+        # Load previous comments if file is specified
+        previous_comments = {}
+        if previous_comments_file:
+            previous_comments = self.load_previous_comments(previous_comments_file)
+
+        # Load existing temp comments and merge with previous comments
+        temp_comments = {}
         if os.path.exists(self.temp_comments_file):
             try:
                 with open(self.temp_comments_file, 'r') as f:
@@ -2597,17 +2722,23 @@ class ImageReviewApp:
                     saved_hash = data.get("image_files_hash", "")
                     saved_comments = data.get("comments", {})
                     current_hash = self._get_image_files_hash()
+
                     if self.image_dir == saved_image_dir and current_hash == saved_hash:
-                        self.comments = saved_comments
-                        print(f"Loaded {len(self.comments)} comments from temp file")
-                    else:
-                        self.comments = {}
-                        print("Dataset mismatch; comments not loaded")
+                        temp_comments = saved_comments
+                        print(f"Loaded {len(temp_comments)} temp comments")
             except Exception as e:
-                print(f"Failed to load comments from temp file: {e}")
-                self.comments = {}
-        else:
-            self.comments = {}
+                print(f"Failed to load temp comments: {e}")
+
+        # Merge comments: temp comments take precedence over previous comments
+        self.comments = previous_comments.copy()
+        self.comments.update(temp_comments)  # This will overwrite previous with temp where both exist
+
+        if previous_comments or temp_comments:
+            total_loaded = len(self.comments)
+            from_previous = len(previous_comments)
+            from_temp = len(temp_comments)
+            print(f"Total comments loaded: {total_loaded} (Previous: {from_previous}, Temp: {from_temp})")
+
         self.update_counter()
         self.load_new_image()
 
